@@ -127,11 +127,16 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
       if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
         raise NotImplementedError(f"{precision=} not supported.")
 
-      if ragged_dot_dimension_numbers != base.DEFAULT_RAGGED_DOT_DIM_NUMS:
+      if ragged_dot_dimension_numbers == base.RAGGED_CONTRACTING_DOT_DIM_NUMS:
+        lhs = quantization.as_array(lhs)
+        rhs = quantization.as_array(rhs)
+        fn = sm100.ragged_contracting_dim_dot_kernel_sm100
+      elif ragged_dot_dimension_numbers != base.DEFAULT_RAGGED_DOT_DIM_NUMS:
         raise NotImplementedError(
-            "Only default `ragged_dot_dimension_numbers` supported."
+            "Only default and ragged contracting `ragged_dot_dimension_numbers`"
+            " supported."
         )
-      if isinstance(rhs, QArray):
+      elif isinstance(rhs, QArray):
         if isinstance(lhs, QArray):
           if lhs.qtype == jnp.int8:
             fn = sm100_i8_quant.ragged_dot_gpu_i8_quant_blackwell_kernel
