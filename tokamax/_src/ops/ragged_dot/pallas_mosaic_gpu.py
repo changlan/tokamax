@@ -124,13 +124,19 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
       else:
         raise NotImplementedError("Unsupported ragged dot dimension numbers.")
     elif gpu_utils.is_sm100():
-      if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
-        raise NotImplementedError(f"{precision=} not supported.")
-
       if ragged_dot_dimension_numbers == base.RAGGED_CONTRACTING_DOT_DIM_NUMS:
         lhs = quantization.as_array(lhs)
         rhs = quantization.as_array(rhs)
+
+        if precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32:
+          lhs = lhs.astype(jnp.bfloat16)
+          rhs = rhs.astype(jnp.bfloat16)
+        elif not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
+          raise NotImplementedError(f"{precision=} not supported.")
+
         fn = sm100.ragged_contracting_dim_dot_kernel_sm100
+      elif not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
+        raise NotImplementedError(f"{precision=} not supported.")
       elif ragged_dot_dimension_numbers != base.DEFAULT_RAGGED_DOT_DIM_NUMS:
         raise NotImplementedError(
             "Only default and ragged contracting `ragged_dot_dimension_numbers`"
