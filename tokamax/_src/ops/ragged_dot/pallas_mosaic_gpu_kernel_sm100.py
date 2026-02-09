@@ -376,7 +376,7 @@ def ragged_contracting_dim_dot_kernel_sm100(
         out_gmem,
     ) = refs
     scratch_buffers, barriers = scoped
-    x_smem, w_smem, acc_smem, acc_tmem = scratch_buffers
+    x_smem, w_smem, acc_smem, w_masked_tmem, acc_tmem = scratch_buffers
     (
         xw_tma_barrier,
         consumed_barrier,
@@ -455,10 +455,15 @@ def ragged_contracting_dim_dot_kernel_sm100(
                 )
                 w_masked = w_tile * mask.astype(w_tile.dtype)
 
+              with jax.named_scope("store masked to tmem"):
+                # Store masked RHS to TMEM for tcgen05_mma
+                plgpu.async_store_tmem(w_masked_tmem, w_masked)
+                plgpu.commit_tmem()
+
               with jax.named_scope("issuing mma"):
                 plgpu.tcgen05_mma(
                     acc_tmem,
-                    w_masked,
+                    w_masked_tmem,
                     x_smem.at[slot].T,
                     consumed_barrier.at[slot],
                     accumulate=(ki > 0),
@@ -497,6 +502,8 @@ def ragged_contracting_dim_dot_kernel_sm100(
 
     x_smem = tiled_smem((num_stages, block_m, block_k), x.dtype, "x")
     w_smem = tiled_smem((num_stages, block_n, block_k), w.dtype, "w")
+    # TMEM buffer for masked RHS tile
+    w_masked_tmem = plgpu.TMEM((block_n, block_k), dtype=w.dtype, packed=True)
     acc_tmem = plgpu.TMEM((block_n, block_m), dtype=jnp.float32)
     acc_smem = plgpu.SMEM(
         (block_m, block_n),
@@ -513,7 +520,7 @@ def ragged_contracting_dim_dot_kernel_sm100(
     mma_done_barrier = plgpu.Barrier(num_barriers=1, orders_tensor_core=True)
     pl.run_scoped(
         lambda *args: kernel(*refs, scoped=args),
-        (x_smem, w_smem, acc_smem, acc_tmem),
+        (x_smem, w_smem, acc_smem, w_masked_tmem, acc_tmem),
         (
             xw_tma_barrier,
             consumed_barrier,
