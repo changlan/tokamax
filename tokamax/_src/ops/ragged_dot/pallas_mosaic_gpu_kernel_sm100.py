@@ -444,9 +444,7 @@ def ragged_contracting_dim_dot_kernel_sm100(
 
               with jax.named_scope("load and mask rhs"):
                 # Load RHS from SMEM
-                w_tile = plgpu.async_load_smem(w_smem.at[slot])
-                plgpu.wait_load_smem()
-                w_tile = plgpu.layout_cast(w_tile, _TCGEN05_TRANSPOSED)
+                w_tile = plgpu.load(w_smem.at[slot], ())
 
                 # Compute K mask for this block
                 kx = plgpu.broadcasted_iota(
