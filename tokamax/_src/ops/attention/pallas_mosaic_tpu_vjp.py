@@ -119,11 +119,9 @@ class PallasMosaicTpuFlashAttentionVjp(
         lambda x: jnp.swapaxes(x, 1, 2), (q_4d, k_4d, v_4d, dout_4d, out_4d)
     )
 
-    is_mqa = num_q_heads != num_kv_heads
+    is_mqa = num_kv_heads == 1
     if num_q_heads % num_kv_heads:
       raise ValueError(f"{num_q_heads=} must be divisible by {num_kv_heads=}")
-    if is_mqa and num_kv_heads != 1:
-      raise NotImplementedError("Grouped query attention is not implemented.")
     splash_config = dataclasses.replace(
         splash.SplashConfig.get_default(),
         attn_logits_soft_cap=logits_soft_cap,
@@ -203,7 +201,7 @@ class PallasMosaicTpuFlashAttentionVjp(
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    q, k = ba.args[3], ba.args[4]
+    q, k = ba.arguments['q'], ba.arguments['k']
     q_seq_len, kv_seq_len = q.shape[-3], k.shape[-3]
     # TODO: Add 256, 8192 once autotuning bugs are fixed.
     tiles = [512, 1024, 2048, 4096]
@@ -213,6 +211,14 @@ class PallasMosaicTpuFlashAttentionVjp(
         tiles,
         tiles,
     ):
+      # TODO: For sparse masks smaller block sizes could give
+      # better performance.
+      if q_seq_len >= 1024 and bq < 1024:
+        continue
+      if kv_seq_len >= 1024 and bkv < 1024:
+        continue
+      if bkv_c > 1024:
+        continue
       if bkv % bkv_c == 0 and bq <= q_seq_len and bkv <= kv_seq_len:
         configs.add(
             Config(

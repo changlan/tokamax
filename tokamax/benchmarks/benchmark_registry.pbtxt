@@ -18,8 +18,6 @@ benchmarks {
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
     workflow_type: [SCHEDULED]
     workload_action_inputs { key: "extras_hw" value: "cuda" }
-    # TODO: Enable 'mosaic' and None once bug is fixed.
-    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=None,mosaic" }
   }
 
   environment_configs {
@@ -49,7 +47,7 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/default/forward"
+    name: "attention/basic/default/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -57,7 +55,7 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/default/forward_and_vjp"
+    name: "attention/basic/default/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -65,7 +63,7 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/triton/forward"
+    name: "attention/basic/triton/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -73,7 +71,7 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/triton/forward_and_vjp"
+    name: "attention/basic/triton/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -81,7 +79,7 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/mosaic/forward"
+    name: "attention/basic/mosaic/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -89,7 +87,7 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/mosaic/forward_and_vjp"
+    name: "attention/basic/mosaic/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -97,7 +95,7 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/cudnn/forward"
+    name: "attention/basic/cudnn/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -105,7 +103,7 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/cudnn/forward_and_vjp"
+    name: "attention/basic/cudnn/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -113,7 +111,7 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/xla/forward"
+    name: "attention/basic/xla/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -121,7 +119,7 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/xla/forward_and_vjp"
+    name: "attention/basic/xla/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -129,7 +127,7 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/xla_chunked/forward"
+    name: "attention/basic/xla_chunked/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -137,7 +135,103 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/xla_chunked/forward_and_vjp"
+    name: "attention/basic/xla_chunked/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/default/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/default/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/triton/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/triton/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/mosaic/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/mosaic/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/cudnn/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/cudnn/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/xla/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/xla/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/xla_chunked/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/xla_chunked/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN

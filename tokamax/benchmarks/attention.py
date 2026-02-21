@@ -15,7 +15,6 @@
 
 """Benchmarks for attention."""
 
-import functools
 import os
 
 from absl import flags
@@ -41,11 +40,20 @@ _SKIP_IMPLEMENTATIONS = flags.DEFINE_list(
     'A comma-separated list of implementations to skip.',
 )
 
-EXAMPLE = {
-    'query': jax.ShapeDtypeStruct((2, 8192, 8, 256), jnp.bfloat16),
-    'key': jax.ShapeDtypeStruct((2, 8192, 8, 256), jnp.bfloat16),
-    'value': jax.ShapeDtypeStruct((2, 8192, 8, 256), jnp.bfloat16),
-    'is_causal': True,
+EXAMPLES = {
+    'basic': {
+        'query': jax.ShapeDtypeStruct((2, 8192, 8, 256), jnp.bfloat16),
+        'key': jax.ShapeDtypeStruct((2, 8192, 8, 256), jnp.bfloat16),
+        'value': jax.ShapeDtypeStruct((2, 8192, 8, 256), jnp.bfloat16),
+        'is_causal': True,
+    },
+    'alphafold': {
+        'query': jax.ShapeDtypeStruct((768, 768, 4, 64), jnp.bfloat16),
+        'key': jax.ShapeDtypeStruct((768, 768, 4, 64), jnp.bfloat16),
+        'value': jax.ShapeDtypeStruct((768, 768, 4, 64), jnp.bfloat16),
+        'bias': jax.ShapeDtypeStruct((1, 4, 768, 768), jnp.bfloat16),
+        'mask': jax.ShapeDtypeStruct((768, 1, 1, 768), bool),
+    },
 }
 
 
@@ -55,8 +63,9 @@ class AttentionBenchmark(parameterized.TestCase):
   @parameterized.product(
       implementation=(None, 'triton', 'mosaic', 'cudnn', 'xla', 'xla_chunked'),
       benchmark_mode=('forward', 'forward_and_vjp'),
+      args_spec_name=tuple(EXAMPLES.keys()),
   )
-  def test_attention(self, implementation, benchmark_mode):
+  def test_attention(self, implementation, benchmark_mode, args_spec_name):
     """Test attention."""
 
     logging.info('device_kind=%s', jax.devices()[0].device_kind)
@@ -69,14 +78,6 @@ class AttentionBenchmark(parameterized.TestCase):
     ):
       self.skipTest('Skipping cudnn forward_and_vjp on B200.')
 
-    # TODO: Re-enable once the bug is fixed.
-    if (
-        implementation == 'xla_chunked'
-        and benchmark_mode == 'forward_and_vjp'
-        and 'gpu' == jax.default_backend()
-    ):
-      self.skipTest('Skipping xla_chunked forward_and_vjp on GPU.')
-
     # TODO: Re-enable once Mosaic GPU supports VJP on B200.
     if (
         implementation in ('mosaic', None)
@@ -85,19 +86,25 @@ class AttentionBenchmark(parameterized.TestCase):
     ):
       self.skipTest('Skipping Mosaic forward_and_vjp on B200.')
 
-    if (implementation or 'None') in _SKIP_IMPLEMENTATIONS.value:
+    if args_spec_name == 'alphafold':
+      # TODO: Re-enable once Mosaic TPU supports learnable biases.
+      if jax.default_backend() == 'tpu' and implementation == 'mosaic':
+        self.skipTest('Skipping AlphaFold on TPU.')
+      # TODO: Re-enable once Mosaic GPU supports learnable biases
+      # on B200.
+      if 'B200' in jax.devices()[0].device_kind and implementation == 'mosaic':
+        self.skipTest('Skipping AlphaFold shape on B200.')
+
+    if str(implementation) in _SKIP_IMPLEMENTATIONS.value:
       self.skipTest(
           f"Skipping implementation '{implementation}' as per"
           ' --skip_implementations flag.'
       )
 
+    example = EXAMPLES[args_spec_name] | {'implementation': implementation}
     fn, args = benchmarking.standardize_function(
-        functools.partial(
-            tokamax.dot_product_attention,
-            implementation=implementation,
-            is_causal=True,
-        ),
-        kwargs=EXAMPLE,
+        tokamax.dot_product_attention,
+        kwargs=example,
         mode=benchmark_mode,  # pytype: disable=wrong-arg-types
     )
     fn = jax.jit(fn)
@@ -109,7 +116,9 @@ class AttentionBenchmark(parameterized.TestCase):
         'wallclock_median_time_ms: %s', res_wallclock.median_evaluation_time_ms
     )
 
-    metric_tag = f"attention/{implementation or 'default'}/{benchmark_mode}"
+    metric_tag = (
+        f"attention/{args_spec_name}/{implementation or 'default'}/{benchmark_mode}"
+    )
     tblog_dir = os.environ.get(_TENSORBOARD_OUTPUT_ENV_VAR.value)
 
     if tblog_dir:

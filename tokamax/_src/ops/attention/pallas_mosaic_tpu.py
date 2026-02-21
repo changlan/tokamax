@@ -121,11 +121,9 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
     # the inputs, which introduces overhead.
     q, k, v = map(lambda x: jnp.swapaxes(x, 1, 2), (q, k, v))
 
-    is_mqa = num_q_heads != num_kv_heads
+    is_mqa = num_kv_heads == 1
     if num_q_heads % num_kv_heads:
       raise ValueError(f"{num_q_heads=} must be divisible by {num_kv_heads=}")
-    if is_mqa and num_kv_heads != 1:
-      raise NotImplementedError("Grouped query attention is not implemented.")
     splash_config = dataclasses.replace(
         splash.SplashConfig.get_default(),
         attn_logits_soft_cap=logits_soft_cap,
@@ -198,6 +196,14 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
         layouts,
         schedulers,
     ):
+      # TODO: For sparse masks smaller block sizes could give
+      # better performance.
+      if q_seq_len >= 1024 and bq < 1024:
+        continue
+      if kv_seq_len >= 1024 and bkv < 1024:
+        continue
+      if bkv_c > 1024:
+        continue
       if bkv % bkv_c == 0 and bq <= q_seq_len and bkv <= kv_seq_len:
         config.add(
             Config(
