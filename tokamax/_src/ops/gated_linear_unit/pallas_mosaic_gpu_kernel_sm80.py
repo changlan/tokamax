@@ -159,10 +159,6 @@ def gated_linear_unit(
       scratch_types=(mgpu_lib.tiled_swizzled_smem((tile_m, tile_n), dtype),),
       grid=(4 * backend.get_default_device().core_count,),
       grid_names=("block",),
-      compiler_params=plgpu.CompilerParams(
-          # TODO: Migrate to WG semantics once it supports cp_async.
-          lowering_semantics=plgpu.LoweringSemantics.Lane,
-      ),
   )
   def kernel(x_gmem, weights_gmem, out_gmem, out_smem):
 
@@ -176,9 +172,9 @@ def gated_linear_unit(
       def compute(_, x_smem, wg_smem, wp_smem, accs):
         gates, proj = accs
         with jax.named_scope("load"):
-          x = plgpu.load(x_smem, layout=plgpu.Layout.MMA_LHS(dtype))
-          w = plgpu.load(wg_smem, layout=plgpu.Layout.MMA_RHS(dtype))
-          v = plgpu.load(wp_smem, layout=plgpu.Layout.MMA_RHS(dtype))
+          x = x_smem[...]
+          w = wg_smem[...]
+          v = wp_smem[...]
         with jax.named_scope("mma"):
           gates = plgpu.mma(gates, x, w)
           proj = plgpu.mma(proj, x, v)
@@ -189,7 +185,6 @@ def gated_linear_unit(
       w_spec = spec((tile_k, tile_n), dtype, lambda ki: (ki, ni), "w")
 
       acc = jnp.zeros(out_smem.shape, jnp.float32)
-      acc = plgpu.layout_cast(acc, plgpu.Layout.MMA_ACC(dtype))
       gates, proj = plgpu.emit_pipeline(
           compute,
           grid=(k // tile_k,),
