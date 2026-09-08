@@ -14,12 +14,14 @@
 # ==============================================================================
 
 import pytest
+from collections.abc import Callable
+from typing import Any, cast, override
 from absl.testing import absltest
 import jax
 import jax.numpy as jnp
 from tokamax._src.ops.attention import jax_nn
 from tokamax._src.ops.attention import test_base
-from typing_extensions import override
+
 
 _CUDNN_CUSTOM_CALL_TARGET = 'custom_call_target="__cudnn'
 
@@ -43,13 +45,11 @@ class JaxNnDotProductAttentionTest(test_base.AttentionTestBase):
 
   def _run_test_with_inputs(self, *args, **kwargs):
     impl_kwargs = kwargs.get("impl_kwargs", {})
-    # pytype: disable=attribute-error
     if (
         (impl_kwargs.get("logits_dtype") not in (None, jnp.float32))
         or not impl_kwargs.get("normalize_output", True)
         or impl_kwargs.get("return_residuals", False)
     ):
-      # pytype: enable=attribute-error
       kwargs["expect_supported"] = False
     super()._run_test_with_inputs(*args, **kwargs)
 
@@ -75,11 +75,11 @@ class JaxNnDotProductAttentionCudnnTest(JaxNnDotProductAttentionTest):
 
   def _run_test_with_inputs(self, *args, **kwargs):
     # CuDNN doesn't support f32 inputs.
-    orig_impl = kwargs.get("impl", self._attention_fn)
+    orig_impl = cast(Callable[..., Any], kwargs.get("impl", self._attention_fn))
 
     def impl(q, k, v, *, bias, **kwargs):
-      cast = lambda x: None if x is None else x.astype(jnp.bfloat16)
-      return orig_impl(cast(q), cast(k), cast(v), bias=cast(bias), **kwargs)
+      cast_ = lambda x: None if x is None else x.astype(jnp.bfloat16)
+      return orig_impl(cast_(q), cast_(k), cast_(v), bias=cast_(bias), **kwargs)
 
     kwargs["impl"] = impl
     kwargs["atol"] = 0.025 if "bias" in kwargs else 0.015
@@ -104,8 +104,8 @@ class JaxNnDotProductAttentionCudnnTest(JaxNnDotProductAttentionTest):
   def test_impl_in_hlo(self):
     x = jnp.empty((2, 256, 4, 64), dtype=jnp.bfloat16)
     lowered = jax.jit(self._attention_fn).lower(x, x, x)
-    hlo_text = lowered.compiler_ir(dialect="hlo").as_hlo_text()
-    self.assertIn(_CUDNN_CUSTOM_CALL_TARGET, hlo_text)
+    self.assertIsNotNone(hlo := lowered.compiler_ir("hlo"))
+    self.assertIn(_CUDNN_CUSTOM_CALL_TARGET, hlo.as_hlo_text())
 
 
 if __name__ == "__main__":

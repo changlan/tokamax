@@ -16,17 +16,16 @@
 """Autotuning argument spec."""
 
 import dataclasses
-from typing import Any, Literal, TypeAlias
-
+from typing import Any, Literal
 
 # Tags are used to quickly identify different workloads for the same op.
 # forward_only models are models that only require forward passes - meaning no
 # vjp tuning is required.
-# mlcompass models are models that are tracked by mlcompass. These are all
-# internal models.
-# primary models are models that are considered the "primary" models for the
-# PA.
-Tag: TypeAlias = Literal['primary']
+# Primary arg specs support models that are considered important for key
+# users. These are used for internal nightly benchmarking.
+# 'ci_tests' arg specs are used for tests that run as part of the CI flow.
+# 'primary' arg specs are a superset of 'ci_tests' arg specs.
+type Tag = Literal['primary', 'forward_only', 'ci_tests', 'json']
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -38,12 +37,15 @@ class ArgSpec:
     project: The project the argument specification comes from.
     name: The name of the argument specification.
     tags: Tags for the argument specification.
+    excluded_platforms: Platforms to exclude from tuning for this argument
+      specification.
   """
 
   args: dict[str, Any]
   project: str = ''
   name: str = ''
   tags: tuple[Tag, ...] = ()
+  excluded_platforms: tuple[str, ...] = ()
 
   @property
   def full_name(self) -> str:

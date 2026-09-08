@@ -14,7 +14,9 @@
 # ==============================================================================
 """Benchmarks for attention implementations."""
 
+from collections.abc import Callable
 import functools
+from typing import Any, Final
 
 from absl import app
 from absl import flags
@@ -25,17 +27,12 @@ from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import jax_nn
 from tokamax._src.ops.attention import pallas_mosaic_gpu as mgpu_attn
 from tokamax._src.ops.attention import pallas_triton as triton_attn
-from tokamax._src.ops.flex_attention import pallas_triton as triton_flex
-from tokamax._src.ops.flex_attention import wrapper
 ARG_SPECS = arg_specs.ARG_SPECS
 
 
-_IMPLS = dict(
+_IMPLS: Final[dict[str, Callable[..., Any]]] = dict(
     triton=triton_attn.PallasTritonFlashAttention(),
-    triton_flex=wrapper.WrappedFlexAttention(
-        impl=triton_flex.PallasTritonFlexAttention()
-    ),
-    mosaic=(mgpu_attn.PallasMosaicGpuFlashAttention()),
+    mosaic=mgpu_attn.PallasMosaicGpuFlashAttention(),
     cudnn=jax_nn.JaxNnDotProductAttention(implementation='cudnn'),
     xla=base.DotProductAttention(),
 )
@@ -47,7 +44,7 @@ _BENCHMARK_IMPLS_FWD = flags.DEFINE_list(
 )
 _BENCHMARK_IMPLS_FWD_BWD = flags.DEFINE_list(
     'benchmark_impls_fwd_bwd',
-    'triton,cudnn,xla',
+    'mosaic,triton,cudnn,xla',
     'List of implementations to benchmark forward and backward.',
 )
 _register_benchmark = functools.partial(

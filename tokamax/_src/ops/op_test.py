@@ -14,25 +14,36 @@
 # ==============================================================================
 
 import dataclasses
-import types
 from typing import Any, ClassVar
 
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from jax.extend import backend
 import jax.numpy as jnp
 from tokamax._src import batching
 from tokamax._src import config as config_lib
+from tokamax._src import hlo_utils
 from tokamax._src import utils
 from tokamax._src.ops import op as op_lib
+from tokamax._src.ops.attention import arg_specs as attn_arg_specs
 from tokamax._src.ops.attention import base as attn_base
 from tokamax._src.ops.attention import pallas_triton as pl_attn
+from tokamax._src.ops.gated_linear_unit import arg_specs as glu_arg_specs
+from tokamax._src.ops.gated_linear_unit import base as glu_base
+from tokamax._src.ops.normalization import arg_specs as norm_arg_specs
 from tokamax._src.ops.normalization import base as norm_base
+from tokamax._src.ops.ragged_dot import api
+from tokamax._src.ops.ragged_dot import arg_specs as ragged_dot_arg_specs
 from tokamax._src.ops.ragged_dot import base as ragged_dot_base
 from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
-from tokamax._src.ops.attention import arg_specs as attn_arg_specs
-from tokamax._src.ops.normalization import arg_specs as norm_arg_specs
-from tokamax._src.ops.ragged_dot import arg_specs as ragged_dot_arg_specs
+
+ragged_dot = api.ragged_dot
+
+_ATTN_ARG_SPECS = attn_arg_specs.ARG_SPECS
+_GLU_ARG_SPECS = glu_arg_specs.ARG_SPECS
+_NORM_ARG_SPECS = norm_arg_specs.ARG_SPECS
+_RAGGED_DOT_ARG_SPECS = ragged_dot_arg_specs.ARG_SPECS
 
 
 def _bsd(shape, dtype, vmap_axes):
@@ -45,9 +56,9 @@ def _eval_shape(spec):
   if not callable(spec):
     return spec
 
-  other = [None]
-  merge = [None]
-  out_tree = [None]
+  other: list[Any] = [None]
+  merge: list[Any] = [None]
+  out_tree: list[Any] = [None]
 
   def f():
     out = spec()
@@ -70,7 +81,7 @@ _HEURISTICS_CONFIG = _FakeOpConfig(1)
 _AUTOTUNE_CONFIG = _FakeOpConfig(2)
 
 
-class _FakeOp(op_lib.Op[Any, jax.Array, types.NoneType, _FakeOpConfig, Any]):
+class _FakeOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
   config_cls: ClassVar[type[_FakeOpConfig]] = _FakeOpConfig
 
   def _fwd(self, x: jax.Array, y: jax.Array, *, return_residuals: bool, config):
@@ -87,12 +98,38 @@ class _FakeOp(op_lib.Op[Any, jax.Array, types.NoneType, _FakeOpConfig, Any]):
     return {_AUTOTUNE_CONFIG}
 
 
+class _DeviceRestrictedOp(_FakeOp):
+
+  def supported_on(self, device: jax.Device) -> bool:
+    del device
+    return False
+
+
 class OpTest(parameterized.TestCase):
 
   def test_bind(self):
     x = jnp.zeros((1, 2))
     y = jnp.ones((1, 2))
     self.assertEqual(_FakeOp().bind(x, y).args, (x, y))
+
+  def test_device_restriction_raises_on_unsupported_device(self):
+    x = jnp.zeros((1, 2))
+    y = jnp.ones((1, 2))
+    with self.assertRaisesRegex(NotImplementedError, "Not supported on"):
+      _DeviceRestrictedOp()(x, y)
+
+  def test_bypass_device_check_bypasses_device_restriction(self):
+    x = jnp.zeros((1, 2))
+    y = jnp.ones((1, 2))
+    out = _DeviceRestrictedOp().replace(bypass_device_check=True)(x, y)
+    self.assertTrue(jnp.array_equal(out, x + y))
+
+  def test_cross_compile_config_bypasses_device_restriction(self):
+    x = jnp.zeros((1, 2))
+    y = jnp.ones((1, 2))
+    with config_lib.cross_compile(True):
+      out = _DeviceRestrictedOp()(x, y)
+    self.assertTrue(jnp.array_equal(out, x + y))
 
 
 class BoundArgumentsTest(parameterized.TestCase):
@@ -156,6 +193,17 @@ class BoundArgumentsTest(parameterized.TestCase):
     self.assertIs(results.fastest_config, config)
     self.assertNotEmpty(cache)
 
+  def test_autotune_with_timeout(self):
+    config = _FakeOpConfig(3)
+    x = jnp.zeros((1, 2))
+    y = jnp.ones((1, 2))
+    results = (
+        _FakeOp()
+        .bind(x, y)
+        .autotune({config}, cache_results=False, timeout=120.0)
+    )
+    self.assertIs(results.fastest_config, config)
+
   @parameterized.parameters(
       ((1,), (None,)), ((0, 0), (0, None)), ((1, 0), (None, 0))
   )
@@ -179,32 +227,32 @@ class BoundArgumentsTest(parameterized.TestCase):
     self.assertEqual(hash(_FakeOp().bind(x, y)), hash(_FakeOp().bind(x, y)))
 
   @parameterized.named_parameters(
-      ("attention", attn_base.DotProductAttention(), attn_arg_specs),
-      ("pl_attn", pl_attn.PallasTritonFlashAttention(), attn_arg_specs),
+      ("attention", attn_base.DotProductAttention(), _ATTN_ARG_SPECS),
+      ("pl_attn", pl_attn.PallasTritonFlashAttention(), _ATTN_ARG_SPECS),
       (
           "pl_attn_stable_softmax",
           pl_attn.PallasTritonFlashAttention(use_stable_softmax=True),
-          attn_arg_specs,
+          _ATTN_ARG_SPECS,
       ),
-      ("normalization", norm_base.Normalization(), norm_arg_specs),
-      ("ragged_dot", ragged_dot_base.RaggedDot(), ragged_dot_arg_specs),
+      ("glu", glu_base.GatedLinearUnit(), _GLU_ARG_SPECS),
+      ("normalization", norm_base.Normalization(), _NORM_ARG_SPECS),
+      ("ragged_dot", ragged_dot_base.RaggedDot(), _RAGGED_DOT_ARG_SPECS),
       (
           "pl_ragged_dot",
           pl_ragged_dot.PallasTritonRaggedDot(),
-          ragged_dot_arg_specs,
+          _RAGGED_DOT_ARG_SPECS,
       ),
       (
           "pl_ragged_dot_split_k_intermediate_dtype",
           pl_ragged_dot.PallasTritonRaggedDot(
               split_k_intermediate_dtype=jnp.float32
           ),
-          ragged_dot_arg_specs,
+          _RAGGED_DOT_ARG_SPECS,
       ),
   )
   def test_roundtrip(self, op, arg_specs):
     op = op.replace(vjp=None)
     adapter = op_lib.BOUND_ARGS_ADAPTER
-    arg_specs = arg_specs.ARG_SPECS
     for arg_spec in arg_specs:
       spec = arg_spec.args
       with self.subTest(arg_spec.full_name):
@@ -215,6 +263,29 @@ class BoundArgumentsTest(parameterized.TestCase):
         self.assertEqual(ba, ba2.replace(op=ba2.op.replace(vjp=None)))
         ba3 = adapter.validate_json(adapter.dump_json(ba))
         self.assertEqual(ba, ba3.replace(op=ba3.op.replace(vjp=None)))
+
+  def test_ignore_cache_overlay(self):
+    if "H100" not in backend.get_default_device().device_kind:
+      self.skipTest("Only test on H100 GPU.")
+    # Use a real op so that we have a real autotuning cache.
+    # Read in the autotuning cache and then with the overlay it should be None.
+    ba = norm_base.Normalization().bind(
+        x=jax.ShapeDtypeStruct((2, 2), jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
+        scale=None,
+        offset=None,
+        axis=-1,
+        epsilon=1e-6,
+        scale_offset=0.0,
+        subtract_mean=False,
+        return_residuals=False,
+    )
+    self.assertIsNotNone(ba.cached_autotuning_data)
+
+    with config_lib.ignore_autotuning_cache(True):
+      self.assertIsNone(ba.cached_autotuning_data)
+
+    with config_lib.ignore_autotuning_cache(False):
+      self.assertIsNotNone(ba.cached_autotuning_data)
 
 
 if __name__ == "__main__":

@@ -12,17 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Pallas Mosaic TPU Megablox."""
+"""Ragged dot Pallas-Mosaic-TPU implementation."""
 
 import dataclasses
-from functools import partial  # pylint: disable=g-importing-member
+import functools
 import itertools
-import types
-from typing import Callable, ClassVar
-
+from typing import Any, ClassVar, override
 import jax
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
+import numpy as np
 import pydantic
 import qwix
 from tokamax._src import precision as precision_lib
@@ -30,7 +29,6 @@ from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_kernel as backend
-from typing_extensions import override
 
 
 # Tiling on TPU technically needs to be a multiple of 128, but it's possible to
@@ -45,16 +43,7 @@ InputBufferCount = pydantic.PositiveInt
 
 QArray = base.QArray
 AsQArray = base.AsQArray
-Residuals = types.NoneType
-
-LUTKey = tuple[
-    pydantic.PositiveInt,  # m
-    pydantic.PositiveInt,  # k
-    pydantic.PositiveInt,  # n
-    pydantic.PositiveInt,  # g
-    bool,  # is_quantized
-]
-LUTValue = tuple[TilingTuple, InputBufferCount]
+Residuals = None
 
 
 def _group_sizes_to_indices(gs: jax.Array, *, m: int) -> jax.Array:
@@ -76,73 +65,6 @@ class Config:
   combine_scopes: bool = False
 
 
-# A temporary lookup table for optimized configs.
-# TODO: formally add autotuning to the vjp.
-GMM_TILING_TUNED_LUT: dict[LUTKey, LUTValue] = {
-    (262144, 7168, 2048, 256, False): ((256, 7168, 512), 2),
-    (262144, 7168, 2048, 256, True): ((128, 7168, 2048), 2),
-    (262144, 2048, 7168, 256, False): ((128, 2048, 3584), 2),
-    (262144, 2048, 7168, 256, True): ((256, 2048, 3584), 3),
-    (327680, 2880, 2880, 128, False): ((512, 2944, 1536), 2),
-    (393216, 2048, 768, 128, False): ((512, 2048, 768), 2),
-    (393216, 768, 2048, 128, False): ((1024, 768, 2048), 2),
-    (524288, 4096, 1536, 128, False): ((256, 4096, 1536), 2),
-    (524288, 1536, 4096, 128, False): ((512, 1536, 1536), 2),
-    (262144, 4096, 1536, 128, False): ((256, 4096, 1536), 2),
-    (262144, 1536, 4096, 128, False): ((256, 1536, 4096), 2),
-    (131072, 7168, 2048, 256, False): ((128, 7168, 1024), 2),
-    (131072, 2048, 7168, 256, False): ((128, 2048, 3584), 2),
-    (131072, 4096, 1536, 128, False): ((256, 4096, 1536), 2),
-    (131072, 1536, 4096, 128, False): ((256, 1536, 4096), 2),
-    (131072, 7168, 2048, 256, False): ((512, 3584, 1024), 2),
-    (65536, 7168, 2048, 256, False): ((256, 3584, 1024), 2),
-    (131072, 7168, 512, 256, False): ((128, 7168, 512), 3),
-    (131072, 512, 7168, 256, False): ((256, 512, 7168), 2),
-}
-GMM_RHS_TRANSPOSE_TILING_TUNED_LUT: dict[LUTKey, LUTValue] = {
-    (262144, 7168, 2048, 256, False): ((256, 2048, 1792), 2),
-    (262144, 7168, 2048, 256, True): ((256, 2048, 3584), 2),
-    (262144, 2048, 7168, 256, False): ((256, 7168, 512), 2),
-    (262144, 2048, 7168, 256, True): ((256, 7168, 1024), 2),
-    (327680, 2880, 2880, 128, False): ((512, 2944, 1536), 2),
-    (393216, 2048, 768, 128, False): ((1024, 768, 2048), 2),
-    (393216, 768, 2048, 128, False): ((512, 2048, 768), 2),
-    (524288, 4096, 1536, 128, False): ((1024, 1536, 1024), 2),
-    (524288, 1536, 4096, 128, False): ((1024, 1024, 1536), 2),
-    (262144, 4096, 1536, 128, False): ((512, 1536, 1024), 2),
-    (262144, 1536, 4096, 128, False): ((1024, 1024, 1536), 2),
-    (131072, 7168, 2048, 256, False): ((256, 2048, 1792), 2),
-    (131072, 2048, 7168, 256, False): ((512, 7168, 512), 2),
-    (131072, 4096, 1536, 128, False): ((512, 1536, 1024), 2),
-    (131072, 1536, 4096, 128, False): ((512, 1024, 1536), 2),
-    (131072, 7168, 2048, 256, False): ((512, 2048, 1792), 2),
-    (65536, 7168, 2048, 256, False): ((512, 2048, 1024), 2),
-    (131072, 7168, 512, 256, False): ((256, 512, 7168), 2),
-    (131072, 512, 7168, 256, False): ((256, 7168, 512), 3),
-}
-TGMM_TILING_TUNED_LUT: dict[LUTKey, LUTValue] = {
-    (262144, 7168, 2048, 256, False): ((512, 1024, 2048), 3),
-    (262144, 7168, 2048, 256, True): ((512, 1024, 2048), 2),
-    (262144, 2048, 7168, 256, False): ((256, 2048, 1024), 3),
-    (262144, 2048, 7168, 256, True): ((512, 512, 3584), 2),
-    (327680, 2880, 2880, 128, False): ((512, 2944, 768), 2),
-    (393216, 2048, 768, 128, False): ((512, 2048, 768), 3),
-    (393216, 768, 2048, 128, False): ((512, 768, 2048), 3),
-    (524288, 4096, 1536, 128, False): ((512, 4096, 512), 2),
-    (524288, 1536, 4096, 128, False): ((512, 512, 4096), 2),
-    (262144, 4096, 1536, 128, False): ((512, 4096, 512), 2),
-    (262144, 1536, 4096, 128, False): ((512, 512, 4096), 2),
-    (131072, 7168, 2048, 256, False): ((256, 1024, 2048), 2),
-    (131072, 2048, 7168, 256, False): ((256, 2048, 1024), 2),
-    (131072, 4096, 1536, 128, False): ((512, 1024, 1536), 2),
-    (131072, 1536, 4096, 128, False): ((512, 512, 4096), 2),
-    (131072, 7168, 2048, 256, False): ((256, 1792, 1024), 3),
-    (65536, 7168, 2048, 256, False): ((256, 1024, 2048), 2),
-    (131072, 7168, 512, 256, False): ((256, 7168, 512), 3),
-    (131072, 512, 7168, 256, False): ((256, 256, 7168), 3),
-}
-
-# Ragged dot dimension numbers supported by the megablox kernel.
 DEFAULT_RAGGED_DOT_DIM_NUMS = base.DEFAULT_RAGGED_DOT_DIM_NUMS
 
 DLHS_RAGGED_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
@@ -188,7 +110,9 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           *args, **kw
       )
       object.__setattr__(
-          self, "vjp", partial(base.vjp, dlhs_ragged_dot=fn, drhs_ragged_dot=fn)
+          self,
+          "vjp",
+          functools.partial(base.vjp, dlhs_ragged_dot=fn, drhs_ragged_dot=fn),
       )
 
   @override
@@ -204,7 +128,35 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       return_residuals: bool = False,
       config: Config,
       activation: base.ActivationFunction | None = None,
+      manual_axis_type: jax.sharding.ManualAxisType | None = None,
+      group_offset: jax.Array | None = None,
+      rhs_scale: jax.Array | None = None,
+      rhs_bias: jax.Array | None = None,
+      maybe_quantize_lhs: bool = False,
+      lhs_scale: jax.Array | None = None,
+      zero_initialize: bool = True,
+      fuse_gateup_activation: str | None = None,
+      lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
+      rhs_quantization_dtype: jax.typing.DTypeLike | None = None,
   ) -> tuple[jax.Array, base.Residuals]:
+    if (
+        group_offset is not None
+        or rhs_scale is not None
+        or rhs_bias is not None
+        or maybe_quantize_lhs
+        or lhs_scale is not None
+        or not zero_initialize
+        or fuse_gateup_activation is not None
+        or lhs_quantization_dtype is not None
+        or rhs_quantization_dtype is not None
+    ):
+      raise NotImplementedError(
+          "The Pallas-Mosaic-TPU-v1 implementation does not support"
+          " group_offset, rhs_scale, rhs_bias, maybe_quantize_lhs, lhs_scale,"
+          " zero_initialize, fuse_gateup_activation, lhs_quantization_dtype,"
+          " or rhs_quantization_dtype."
+      )
+
     # TODO: Support more ragged_dot_dimension_numbers
     # configurations.
 
@@ -237,15 +189,16 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       lhs = maybe_quantize(lhs, (1, lhs.shape[1]))
       rhs = maybe_quantize(rhs, (1, rhs.shape[1], 1))
       out = backend.gmm(
-          lhs,
-          rhs,
+          lhs,  # [m, k]
+          rhs,  # [g, k, n]
           group_sizes=group_sizes,
           precision=precision,
           out_dtype=preferred_element_type,
           tiling=(config.tile_m, config.tile_k, config.tile_n),
-          interpret=self.interpret,  # pytype: disable=attribute-error
+          interpret=self.interpret,
           input_buffer_count=config.input_buffer_count,
           activation=activation if not return_residuals else None,
+          manual_axis_type=manual_axis_type,
       )
     elif ragged_dot_dimension_numbers == DLHS_RAGGED_DOT_DIM_NUMS:  # dlhs
       # here, handle fast-path special cases that arise in backwards gmm
@@ -263,19 +216,22 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
         lhs = maybe_quantize(lhs, (1, lhs.shape[1]))
         rhs = maybe_quantize(rhs, (1, 1, rhs.shape[2]))
       out = backend.gmm(
-          lhs,
-          rhs,
+          lhs,  # [m, n]
+          rhs,  # [g, k, n]
           group_sizes=group_sizes,
           precision=precision,
           out_dtype=preferred_element_type,
-          tiling=(config.tile_m, config.tile_k, config.tile_n),
+          # Treat config.tile_n as tk (backend contracting dim) and
+          # config.tile_k as tn (backend minor dim)
+          tiling=(config.tile_m, config.tile_n, config.tile_k),
           transpose_rhs=True,
-          interpret=self.interpret,  # pytype: disable=attribute-error
+          interpret=self.interpret,
           input_buffer_count=config.input_buffer_count,
           activation=activation if not return_residuals else None,
+          manual_axis_type=manual_axis_type,
       )
     elif ragged_dot_dimension_numbers == DRHS_RAGGED_DOT_DIM_NUMS:  # drhs
-      lhs_trans = jax.tree.map(lambda x: x.mT, lhs)
+      lhs_trans = jax.tree.map(lambda x: x.mT, lhs)  # [m, k] -> [k, m]
       # here, handle fast-path special cases that arise in backwards gmm
       if isinstance(lhs_trans, QArray) and isinstance(rhs, jax.Array):
         if lhs_trans.scale.shape[0] == 1:
@@ -292,16 +248,17 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
         rhs = maybe_quantize(rhs, (rhs.shape[0], 1))
 
       out = backend.tgmm(
-          lhs_trans,
-          rhs,
+          lhs_trans,  # [k, m]
+          rhs,  # [m, n]
           group_sizes=group_sizes,
           precision=precision,
           out_dtype=preferred_element_type,
           tiling=(config.tile_m, config.tile_k, config.tile_n),
-          interpret=self.interpret,  # pytype: disable=attribute-error
+          interpret=self.interpret,
           input_buffer_count=config.input_buffer_count,
           activation=activation if not return_residuals else None,
           combine_scopes=config.combine_scopes,
+          manual_axis_type=manual_axis_type,
       )
     else:
       raise NotImplementedError(
@@ -314,68 +271,179 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
 
     return out, residuals if return_residuals else None
 
+  def _fit_within_tpu_vmem(
+      self,
+      input_tiles: list[tuple[int, int, Any]],
+      output_tile: tuple[int, int, Any],
+      input_buffer_count: int,
+      utilize_ratio: float = 0.75,
+  ) -> bool:
+    """Returns whether the given tiling fits within TPU VMEM."""
+    total_size = 0
+    for tile in input_tiles:
+      tile_size = np.prod(tile[:-1])
+      dtype = tile[-1]
+      # For Quantized types, we assume that the upper bound on the tile size is
+      # bfloat16. That is, the QArray tile size (qvalue + scale) should be less
+      # than or equal to the bfloat16 tile size.
+      num_bytes = max(jnp.dtype(dtype).itemsize, 2)
+      tile_size *= num_bytes
+      total_size += tile_size * input_buffer_count
+
+    # Now do the same for the output tile.
+    output_tile_size = np.prod(output_tile[:-1])
+    dtype = output_tile[-1]
+    # For Quantized types, we assume that the upper bound on the tile size is
+    # bfloat16. That is, the QArray tile size (qvalue + scale) should be less
+    # than or equal to the bfloat16 tile size.
+    num_bytes = max(jnp.dtype(dtype).itemsize, 2)
+    output_tile_size *= num_bytes
+    # To account for accumulation buffer and prefetch, otherwise we see OOM
+    # errors.
+    total_size += 3 * output_tile_size
+
+    # Get the TPU scoped VMEM size. Default to half of the VMEM capacity.
+    tpu_info = pltpu.get_tpu_info()
+    scoped_vmem_capacity = tpu_info.vmem_capacity_bytes / 2
+    if tpu_info.generation == 6:
+      scoped_vmem_capacity /= 2
+    elif tpu_info.generation == 5:
+      scoped_vmem_capacity /= 4
+    return total_size <= scoped_vmem_capacity * utilize_ratio
+
+  def _deflate_tile(self, current_tile: int) -> int:
+    if current_tile <= 128:
+      return 128
+    new_tile = current_tile // 2
+    # Ensure partial tiles are always multiples of 128
+    return max((new_tile // 128) * 128, 128)
+
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    lhs, rhs = ba.arguments["lhs"], ba.arguments["rhs"]
+    if self.qdtype is not None:
+      return Config()
+    # Currently the heuristics are only implemented for TPU7x.
+    if pltpu.get_tpu_info().generation < 7:
+      return Config()
+    lhs, rhs = ba.args
 
-    # this is generally an incorrect assumption, but ok for a heuristic
-    is_quantized = isinstance(lhs, QArray) or isinstance(rhs, QArray)
-
-    ragged_dot_dimension_numbers = ba.arguments.get(
+    dims = ba.arguments.get(
         "ragged_dot_dimension_numbers", DEFAULT_RAGGED_DOT_DIM_NUMS
     )
-    default_config = Config()
-    if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:
-      (m, k), (g, _, n) = lhs.shape, rhs.shape
-      lut_key = (m, k, n, g, is_quantized)
-      if lut_key in GMM_TILING_TUNED_LUT:
-        (tile_m, tile_k, tile_n), input_buffer_count = GMM_TILING_TUNED_LUT[
-            lut_key
-        ]
-        return Config(
-            input_buffer_count=input_buffer_count,
-            tile_m=tile_m,
-            tile_k=tile_k,
-            tile_n=tile_n,
-        )
-      return default_config
-    elif ragged_dot_dimension_numbers == DLHS_RAGGED_DOT_DIM_NUMS:
-      grad = lhs
-      (m, n), (g, k, _) = grad.shape, rhs.shape  # lhs is out
-      lut_key = (m, k, n, g, is_quantized)
-      if lut_key in GMM_RHS_TRANSPOSE_TILING_TUNED_LUT:
-        (tile_m, tile_k, tile_n), input_buffer_count = (
-            GMM_RHS_TRANSPOSE_TILING_TUNED_LUT[lut_key]
-        )
-        return Config(
-            input_buffer_count=input_buffer_count,
-            tile_m=tile_m,
-            tile_k=tile_k,
-            tile_n=tile_n,
-        )
-      return default_config
-    elif ragged_dot_dimension_numbers == DRHS_RAGGED_DOT_DIM_NUMS:
-      group_sizes = ba.arguments["group_sizes"]
-      grad = rhs
-      if isinstance(group_sizes, base.GroupSizes):
-        group_sizes = jnp.array(group_sizes)
-      (m, k), (_, n), g = lhs.shape, grad.shape, group_sizes.shape[0]
-      lut_key = (m, k, n, g, is_quantized)
-      if lut_key in TGMM_TILING_TUNED_LUT:
-        (tile_m, tile_k, tile_n), input_buffer_count = TGMM_TILING_TUNED_LUT[
-            lut_key
-        ]
-        return Config(
-            input_buffer_count=input_buffer_count,
-            tile_m=tile_m,
-            tile_k=tile_k,
-            tile_n=tile_n,
-        )
-      return default_config
+    input_buffer_count = 2
+
+    # Extract the dimensions of the input arrays. Here m, k, n, are the
+    # dimensions of the forward gmm. This is different from the tgmm case which
+    # we will handle in _tgmm_heuristics_config.
+    if dims == DEFAULT_RAGGED_DOT_DIM_NUMS:
+      (m, k), (_, _, n) = lhs.shape, rhs.shape
+    elif dims == DLHS_RAGGED_DOT_DIM_NUMS:
+      (m, n), (_, k, _) = lhs.shape, rhs.shape
+    elif dims == DRHS_RAGGED_DOT_DIM_NUMS:
+      (m, k), (_, n) = lhs.shape, rhs.shape
+      return self._tgmm_heuristics_config(ba, m, n, k, input_buffer_count)
     else:
-      raise NotImplementedError(
-          UNSUPPORTED_DIMENSIONS_MSG.format(ragged_dot_dimension_numbers)
-      )
+      raise ValueError(UNSUPPORTED_DIMENSIONS_MSG.format(dims))
+
+    # Main heuristic: start with the largest possible tile size and "deflate" it
+    # until it fits within VMEM.
+
+    # Default m to 1024.
+    tile_m = min(m, 1024)
+    tile_n = n
+    tile_k = k
+    # Deflate m, min size for m is 128.
+    while (
+        not self._fit_within_tpu_vmem(
+            [(tile_m, tile_k, lhs.dtype), (tile_k, tile_n, rhs.dtype)],
+            (tile_m, tile_n, lhs.dtype),
+            input_buffer_count,
+        )
+        and tile_m > 128
+    ):
+      tile_m = self._deflate_tile(tile_m)
+
+    # Deflate n, min size for n is 128.
+    while (
+        not self._fit_within_tpu_vmem(
+            [(tile_m, tile_k, lhs.dtype), (tile_k, tile_n, rhs.dtype)],
+            (tile_m, tile_n, lhs.dtype),
+            input_buffer_count,
+        )
+        and tile_n > 128
+    ):
+      tile_n = self._deflate_tile(tile_n)
+
+    # Last priority: deflate k (reduction dimension), min size for k is 128.
+    while (
+        not self._fit_within_tpu_vmem(
+            [(tile_m, tile_k, lhs.dtype), (tile_k, tile_n, rhs.dtype)],
+            (tile_m, tile_n, lhs.dtype),
+            input_buffer_count,
+        )
+        and tile_k > 128
+    ):
+      tile_k = self._deflate_tile(tile_k)
+
+    return Config(
+        tile_m=tile_m,
+        tile_k=tile_k,
+        tile_n=tile_n,
+        input_buffer_count=input_buffer_count,
+    )
+
+  def _tgmm_heuristics_config(
+      self, ba: op.BoundArguments, m, n, k, input_buffer_count
+  ) -> Config:
+    """Heuristics config for tgmm."""
+    lhs, rhs = ba.args
+    # tgmm is lhs [m, k] @ rhs [m, n] so it is similar to gmm but transposed.
+    # the input buffer count is still 2.
+    # Reduction dimension for TGMM is m.
+    tile_k = k
+    tile_n = n
+    tile_m = min(m, 1024)  # Cap to 1024 because ragged dimension.
+
+    # Deflate k, min size for k is 128
+    while (
+        not self._fit_within_tpu_vmem(
+            [(tile_m, tile_k, lhs.dtype), (tile_m, tile_n, rhs.dtype)],
+            (tile_k, tile_n, lhs.dtype),
+            input_buffer_count,
+        )
+        and tile_k > 128
+    ):
+      tile_k = self._deflate_tile(tile_k)
+
+    # Deflate n, min size for n is 128
+    while (
+        not self._fit_within_tpu_vmem(
+            [(tile_m, tile_k, lhs.dtype), (tile_m, tile_n, rhs.dtype)],
+            (tile_k, tile_n, lhs.dtype),
+            input_buffer_count,
+        )
+        and tile_n > 128
+    ):
+      tile_n = self._deflate_tile(tile_n)
+
+    # Last priority: deflate m (reduction dimension), min size for m is 128
+    while (
+        not self._fit_within_tpu_vmem(
+            [(tile_m, tile_k, lhs.dtype), (tile_m, tile_n, rhs.dtype)],
+            (tile_k, tile_n, lhs.dtype),
+            input_buffer_count,
+        )
+        and tile_m > 128
+    ):
+      tile_m = self._deflate_tile(tile_m)
+
+    return Config(
+        tile_m=tile_m,
+        tile_k=tile_k,
+        tile_n=tile_n,
+        input_buffer_count=input_buffer_count,
+        combine_scopes=False,
+    )
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
@@ -401,16 +469,18 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     # reasonable compilation time. From our experiments, we found that there
     # is no need on current TPU generations to search for larger tiles for m.
     tile_m_range = [
-        64 * (2**i)
+        128 * (2**i)
         for i in range(8)
-        if 64 * (2**i) <= m and 64 * (2**i) <= 1024
+        if 128 * (2**i) <= m and 128 * (2**i) <= 1024
     ]
 
     tile_k_range = set(
         [
             128 * (2**i) for i in range(8) if 128 * (2**i) <= k_
         ]  # upwards powers of 2
-        + [k_ // (2**i) for i in range(6)]  # downwards divisors of k_
+        + [
+            k_ // (2**i) for i in range(6) if k_ // (2**i) >= 128
+        ]  # downwards divisors of k_
         + [k]  # full tile
     )
 
@@ -418,17 +488,21 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
         [
             128 * (2**i) for i in range(8) if 128 * (2**i) <= n_
         ]  # upwards powers of 2
-        + [n_ // (2**i) for i in range(6)]  # downwards divisors of n_
+        + [
+            n_ // (2**i) for i in range(6) if n_ // (2**i) >= 128
+        ]  # downwards divisors of n_
         + [n]  # full tile
     )
+    input_buffer_count_range = [2, 3, 4]
     return set(
         Config(
             tile_m=tile_m,
             tile_k=tile_k,
             tile_n=tile_n,
+            input_buffer_count=input_buffer_count,
         )
-        for tile_m, tile_k, tile_n in itertools.product(
-            tile_m_range, tile_k_range, tile_n_range
+        for tile_m, tile_k, tile_n, input_buffer_count in itertools.product(
+            tile_m_range, tile_k_range, tile_n_range, input_buffer_count_range
         )
     )
 

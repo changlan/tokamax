@@ -1746,6 +1746,8 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
     for name, arr, exp_start, exp_end, n in test_cases:
       with self.subTest(name):
         start, end = mask_info_lib.find_bounds(np.array(arr))
+        self.assertIsNotNone(start)
+        self.assertIsNotNone(end)
         np.testing.assert_array_equal(start[:n], np.array(exp_start)[:n])
         np.testing.assert_array_equal(end[:n], np.array(exp_end)[:n])
 

@@ -19,7 +19,7 @@ import dataclasses
 import functools
 import itertools
 import threading
-from typing import Any, TypeAlias
+from typing import Any
 from unittest import mock
 
 import jax
@@ -31,7 +31,7 @@ import jax.numpy as jnp
 _zip = functools.partial(zip, strict=True)
 
 
-Indexer: TypeAlias = int | slice | pl.Slice | jax.Array
+type Indexer = int | slice | pl.Slice | jax.Array
 
 
 def dslice(idx: int | jax.Array, size: int) -> slice | pl.Slice:
@@ -88,6 +88,7 @@ class BlockRef:
   @property
   def bounds_checked(self) -> tuple[bool, ...]:
     """Indicates which dimensions require bounds checking."""
+    assert self.spec.block_shape is not None
     if any(isinstance(bs, pl.Element) for bs in self.spec.block_shape):
       return (True,) * self.ndim
     bounds = self.bounds
@@ -102,6 +103,9 @@ class BlockRef:
       Each mask will be broadcastable to the shape of the block. If a dimension,
       doesn't require bounds checking, `None` is returned.
     """
+    assert self.spec.block_shape is not None
+    assert self.spec.index_map is not None
+
     if (indexer := self._ndindexer) is None:
       idx = (slice(None),) * self.ndim
     else:
@@ -182,6 +186,8 @@ class BlockRef:
       **kwargs,
   ) -> jax.Array:
     """Loads a block with `mask=inbounds_mask(bounds_check=bounds_check)`."""
+    assert self.spec.block_shape is not None
+    assert self.spec.index_map is not None
     uses_element_indexing = any(
         isinstance(bd, pl.Element) for bd in self.spec.block_shape
     )
@@ -217,6 +223,7 @@ class BlockRef:
   @property
   def _visible_axes(self) -> tuple[int, ...]:
     """Returns the axes of the referenced array that are visible."""
+    assert self.spec.block_shape is not None
     axes = (a for a, d in enumerate(self.spec.block_shape) if d is not None)
     if (indexer := self._ndindexer) is not None:
       idxs = indexer.indices
@@ -270,7 +277,7 @@ def pallas_call(
     in_specs: Any = pl.no_block_spec,
     out_specs: Any = pl.no_block_spec,
     filter_specs: bool = False,
-    backend="triton",
+    compiler_params: pl.CompilerParams | None = plgpu.CompilerParams(),
     **kwargs,
 ) -> Callable[..., Any]:
   """Invokes `pallas_call`, wrapping refs with a `BlockSpec` as `BlockRef`s."""
@@ -342,7 +349,7 @@ def pallas_call(
         wrapped_kernel,
         out_shape,
         grid_spec=grid_spec,
-        backend=backend,
+        compiler_params=compiler_params,
         **kwargs,
     )(*args)
 

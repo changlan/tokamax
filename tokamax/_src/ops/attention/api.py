@@ -15,7 +15,7 @@
 """Dot product attention API."""
 
 from collections.abc import Callable, Sequence
-from typing import Any, Final, Literal, TypeAlias
+from typing import Any, Final, Literal
 import immutabledict
 import jax
 from jax.extend import backend
@@ -27,14 +27,12 @@ from tokamax._src.ops.attention import jax_nn
 from tokamax._src.ops.attention import xla_chunked
 
 QArray = qwix.QArray
-Implementation: TypeAlias = Literal[
-    "mosaic", "triton", "cudnn", "xla", "xla_chunked"
-]
+type Implementation = Literal["mosaic", "triton", "cudnn", "xla", "xla_chunked"]
 
 # TODO: Investigate if `_XLA_CHUNK_SIZE` should be larger on TPU.
 _XLA_CHUNK_SIZE: Final[tuple[int, int]] = (512, 1024)
 
-IMPLEMENTATIONS = dict(
+_IMPLEMENTATIONS = dict(
     cudnn=jax_nn.JaxNnDotProductAttention(implementation="cudnn"),
     xla=base.DotProductAttention(),
     xla_chunked=xla_chunked.XlaChunkedDotProductAttention(
@@ -43,40 +41,41 @@ IMPLEMENTATIONS = dict(
 )
 # TODO: Investigate if xla_chunked be used instead of xla for very
 # big sequences lengths. Eg. where xla OOMs.
-_DEFAULT_IMPLEMENTATION = ("xla",)
+_DEFAULT_IMPLEMENTATIONS = ("xla",)
 
 try:
-  from tokamax._src.ops.attention import pallas_triton as pl_triton  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.attention import pallas_triton as pl_triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
-  IMPLEMENTATIONS["triton"] = pl_triton.PallasTritonFlashAttention()
-  _DEFAULT_IMPLEMENTATION = ("triton",) + _DEFAULT_IMPLEMENTATION
+  _IMPLEMENTATIONS["triton"] = pl_triton.PallasTritonFlashAttention()
+  _DEFAULT_IMPLEMENTATIONS = ("triton",) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
 
 try:
-  from tokamax._src.ops.attention import pallas_mosaic_gpu as pl_mgpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.attention import pallas_mosaic_gpu as pl_mgpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
-  IMPLEMENTATIONS["mosaic_gpu"] = pl_mgpu.PallasMosaicGpuFlashAttention()
-  _DEFAULT_IMPLEMENTATION = ("mosaic",) + _DEFAULT_IMPLEMENTATION
+  _IMPLEMENTATIONS["mosaic_gpu"] = pl_mgpu.PallasMosaicGpuFlashAttention()
+  _DEFAULT_IMPLEMENTATIONS = ("mosaic",) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
 
 
 try:
-  from tokamax._src.ops.attention import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.attention import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
-  IMPLEMENTATIONS["mosaic_tpu"] = (
+  _IMPLEMENTATIONS["mosaic_tpu"] = (
       pallas_mosaic_tpu.PallasMosaicTpuFlashAttention()
   )
-  if "mosaic" not in _DEFAULT_IMPLEMENTATION:
-    _DEFAULT_IMPLEMENTATION = ("mosaic",) + _DEFAULT_IMPLEMENTATION
+  if "mosaic" not in _DEFAULT_IMPLEMENTATIONS:
+    _DEFAULT_IMPLEMENTATIONS = ("mosaic",) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
 
 
 IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
-    immutabledict.immutabledict(IMPLEMENTATIONS)
+    immutabledict.immutabledict(_IMPLEMENTATIONS)
 )
+del _IMPLEMENTATIONS
 
 
 def dot_product_attention(
@@ -132,22 +131,18 @@ def dot_product_attention(
       raise `NotImplementedError`.
   """
   if implementation is None:
-    implementation = _DEFAULT_IMPLEMENTATION
-
-  if not isinstance(implementation, (tuple, list)):
+    implementation = _DEFAULT_IMPLEMENTATIONS
+  elif isinstance(implementation, str):
     implementation = (implementation,)
   elif not implementation:
     raise ValueError("`implementation` must not be an empty sequence.")
-
-  if scale is None:
-    scale = base.AUTO
 
   if query_seq_lengths is not None:
     query_seq_lengths = query_seq_lengths[:, None, None]
   if key_value_seq_lengths is not None:
     key_value_seq_lengths = key_value_seq_lengths[:, None, None]
 
-  mask = base.Mask(
+  mask_ = base.Mask(
       mask,
       is_causal=is_causal,
       q_end=query_seq_lengths,
@@ -159,8 +154,8 @@ def dot_product_attention(
 
   if local_window_size is not None:
     k_indices = jnp.arange(key.shape[-3])
-    before, after = local_window_size
-    mask &= base.Mask(k_start=k_indices - before, k_end=k_indices + (after + 1))
+    pre, post = local_window_size
+    mask_ &= base.Mask(k_start=k_indices - pre, k_end=k_indices + (post + 1))
 
   errors = []
   for impl in implementation:
@@ -181,8 +176,8 @@ def dot_product_attention(
           key,
           value,
           bias=bias,
-          mask=mask,
-          logits_scale=scale,
+          mask=mask_,
+          logits_scale=base.AUTO if scale is None else scale,
           precision=precision,
           logits_soft_cap=logits_soft_cap,
           q_sharding=q_sharding,

@@ -15,7 +15,7 @@
 """Ragged dot API."""
 
 from collections.abc import Callable, Sequence
-from typing import Any, Final, Literal, TypeAlias
+from typing import Any, Final, Literal
 
 import immutabledict
 import jax
@@ -26,40 +26,52 @@ from tokamax._src.ops.ragged_dot import base
 
 
 QArray = qwix.QArray
-Implementation: TypeAlias = Literal["mosaic", "triton", "xla"]
+type Implementation = Literal["mosaic", "mosaic_tpu_v2", "triton", "xla"]
 
-IMPLEMENTATIONS = dict(xla=base.RaggedDot())
-_DEFAULT_IMPLEMENTATION = ("xla",)
+_IMPLEMENTATIONS = dict(xla=base.RaggedDot())
+_DEFAULT_IMPLEMENTATIONS = ("xla",)
 
 try:
-  from tokamax._src.ops.ragged_dot import pallas_triton  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.ragged_dot import pallas_triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
-  IMPLEMENTATIONS["triton"] = pallas_triton.PallasTritonRaggedDot()
-  _DEFAULT_IMPLEMENTATION = ("triton",) + _DEFAULT_IMPLEMENTATION
+  _IMPLEMENTATIONS["triton"] = pallas_triton.PallasTritonRaggedDot()
+  _DEFAULT_IMPLEMENTATIONS = ("triton",) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
 
 try:
-  from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
-  IMPLEMENTATIONS["mosaic_gpu"] = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot()
-  _DEFAULT_IMPLEMENTATION = ("mosaic",) + _DEFAULT_IMPLEMENTATION
+  _IMPLEMENTATIONS["mosaic_gpu"] = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot()
+  _DEFAULT_IMPLEMENTATIONS = ("mosaic",) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
 
 try:
-  from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
-  IMPLEMENTATIONS["mosaic_tpu"] = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
-  if "mosaic" not in _DEFAULT_IMPLEMENTATION:
-    _DEFAULT_IMPLEMENTATION = ("mosaic",) + _DEFAULT_IMPLEMENTATION
+  _IMPLEMENTATIONS["mosaic_tpu"] = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
+  if "mosaic" not in _DEFAULT_IMPLEMENTATIONS:
+    _DEFAULT_IMPLEMENTATIONS = ("mosaic",) + _DEFAULT_IMPLEMENTATIONS
+except ImportError:
+  pass
+
+try:
+  from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+
+  _IMPLEMENTATIONS["mosaic_tpu_v2"] = (
+      pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
+  )
+  if "mosaic" not in _DEFAULT_IMPLEMENTATIONS:
+    _DEFAULT_IMPLEMENTATIONS = ("mosaic",) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
 
 
 IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
-    immutabledict.immutabledict(IMPLEMENTATIONS)
+    immutabledict.immutabledict(_IMPLEMENTATIONS)
 )
+del _IMPLEMENTATIONS
 
 
 def ragged_dot(
@@ -70,12 +82,14 @@ def ragged_dot(
     preferred_element_type: jax.typing.DTypeLike | None = None,
     group_offset: Array | None = None,
     activation: base.ActivationFunction | None = None,
+    manual_axis_type: jax.sharding.ManualAxisType | None = None,
     *,
     implementation: (
         Implementation
         | Sequence[Implementation | Callable[..., jax.Array]]
         | None
     ) = None,
+    bypass_device_check: bool | None = None,
 ) -> Float[Array, "M N"]:  # pylint: disable=g-doc-args
   """Ragged matrix multiplication.
 
@@ -98,10 +112,13 @@ def ragged_dot(
       accumulator before being cast to the output dtype. If `return_residuals`
       is True, the activation function will not be fused into the kernel, and
       instead applied after the kernel call.
+    manual_axis_type: Optional. Manual axis type for the operation.
     implementation: The implementation to use. By default, `None` is used, which
       will automatically select the best available backend, and is guaranteed to
       work on all platforms. If a sequence is passed, the first implementation
       that doesn't raise a `NotImplementedError` is used.
+    bypass_device_check: Whether to bypass device validation. If None (default),
+      bypasses device check when an implementation is explicitly passed in.
 
   Returns:
     (m, n) shaped array with `preferred_element_type` element type.
@@ -115,7 +132,9 @@ def ragged_dot(
       preferred_element_type=preferred_element_type,
       group_offset=group_offset,
       activation=activation,
+      manual_axis_type=manual_axis_type,
       implementation=implementation,
+      bypass_device_check=bypass_device_check,
   )
 
 
@@ -128,12 +147,14 @@ def ragged_dot_general(
     preferred_element_type: jax.typing.DTypeLike | None = None,
     group_offset: Array | None = None,
     activation: base.ActivationFunction | None = None,
+    manual_axis_type: jax.sharding.ManualAxisType | None = None,
     *,
     implementation: (
         Implementation
         | Sequence[Implementation | Callable[..., jax.Array]]
         | None
     ) = None,
+    bypass_device_check: bool | None = None,
 ) -> Float[Array, "..."]:  # pylint: disable=g-doc-args
   """Ragged matrix multiplication.
 
@@ -155,10 +176,14 @@ def ragged_dot_general(
       group_sizes to start computing from. If not specified, defaults to [0].
     activation: Optional. Activation function to apply to the result. If not
       specified, no activation function is applied.
+    manual_axis_type: Optional. Manual axis type for the operation.
     implementation: The implementation to use. By default, `None` is used, which
       will automatically select the best available backend, and is guaranteed to
       work on all platforms. If a sequence is passed, the first implementation
       that doesn't raise a `NotImplementedError` is used.
+    bypass_device_check: Whether to bypass device validation on the op. If None
+      (default), bypasses device check when an implementation is explicitly
+      passed in (manual implementation).
 
   Returns:
     An array with `preferred_element_type` element type.
@@ -166,10 +191,19 @@ def ragged_dot_general(
   if group_offset is not None:
     raise NotImplementedError("`group_offset` is not yet supported.")
 
-  if implementation is None:
-    implementation = _DEFAULT_IMPLEMENTATION
+  if bypass_device_check is None:
+    # Auto-selection and fallback sequences enforce device checks;
+    # a single explicit implementation bypasses them for CPU export.
+    if implementation is None:
+      bypass_device_check = False
+    elif isinstance(implementation, (list, tuple)):
+      bypass_device_check = len(implementation) <= 1
+    else:
+      bypass_device_check = True
 
-  if not isinstance(implementation, (tuple, list)):
+  if implementation is None:
+    implementation = _DEFAULT_IMPLEMENTATIONS
+  elif isinstance(implementation, str):
     implementation = (implementation,)
   elif not implementation:
     raise ValueError("`implementation` must not be an empty sequence.")
@@ -200,6 +234,14 @@ def ragged_dot_general(
       impl = IMPLEMENTATIONS[impl]
 
     try:
+      # We only pass manual_axis_type if it is explicitly set, since older
+      # implementations might not support this argument yet.
+      kwargs = {}
+      if manual_axis_type is not None:
+        kwargs["manual_axis_type"] = manual_axis_type
+      if bypass_device_check and isinstance(impl, base.op.Op):
+        impl = impl.replace(bypass_device_check=True)
+
       return impl(
           lhs,
           rhs,
@@ -208,6 +250,7 @@ def ragged_dot_general(
           precision=precision,
           preferred_element_type=preferred_element_type,
           activation=activation,
+          **kwargs,
       )
     except NotImplementedError as e:
       if len(implementation) == 1:

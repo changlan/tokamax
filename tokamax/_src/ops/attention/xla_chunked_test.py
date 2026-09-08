@@ -16,7 +16,7 @@
 import dataclasses
 import pytest
 import random
-from typing import cast
+from typing import cast, override
 from unittest import mock
 
 from absl.testing import absltest
@@ -24,10 +24,9 @@ from absl.testing import parameterized
 from flax import linen as nn
 import jax
 import jax.numpy as jnp
-from tokamax._src import quantization
 from tokamax._src.ops.attention import test_base
 from tokamax._src.ops.attention import xla_chunked
-from typing_extensions import override
+
 import pytest
 
 
@@ -64,7 +63,7 @@ class XlaChunkedAttentionTest(test_base.AttentionTestBase):
 
   def test_normalize_output(self):
     with test_base.override_test_args(atol_grads=3e-5):
-      super().test_normalize_output()  # pytype: disable=attribute-error
+      super().test_normalize_output()
 
 
 def _split_into_pages(unpadded_k, unpadded_v, max_num_pages, max_page_size):

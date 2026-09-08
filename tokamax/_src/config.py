@@ -17,51 +17,46 @@
 import contextlib
 import dataclasses
 import sys
-import threading
-from typing import Generic, TypeVar
+from typing import Any
 
 from absl import flags
+import jax
 
-
-_ABSENT = object()
-_STATE = threading.local()
-_T = TypeVar("_T")
-
-
-@contextlib.contextmanager
-def _option_override_scope(name, value):
-  prev_value = getattr(_STATE, name, _ABSENT)
-  try:
-    setattr(_STATE, name, value)
-    yield
-  finally:
-    if prev_value is _ABSENT:
-      delattr(_STATE, name)
-    else:
-      setattr(_STATE, name, prev_value)
+_DEFAULT = object()
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class _ConfigOption(Generic[_T]):
+class _ConfigOption[T]:
   """A configuration option."""
 
-  flag: flags.FlagHolder[_T]
+  flag: flags.FlagHolder[T]
+  config: Any = None
 
-  def __call__(self, value: _T) -> contextlib.AbstractContextManager[None]:
+  def __post_init__(self):
+    if self.config is None:
+      object.__setattr__(self, "config", jax.make_user_context(_DEFAULT))
+
+  def __call__(self, value: T | str) -> contextlib.AbstractContextManager[None]:
     name = self.flag.name
     flag = self.flag._flagvalues[name]
+
     try:
-      value = flag.parser.parse(value)
+      value_ = flag.parser.parse(value) if isinstance(value, str) else value
     except ValueError as e:
       raise ValueError(f"Invalid value for config `{name}`: {value}") from e
 
-    return _option_override_scope(name, value)
+    return self.config(value_)
 
   @property
-  def value(self) -> _T:
+  def value(self) -> T:
     if not flags.FLAGS.is_parsed():
-      flags.FLAGS(sys.argv)
-    return getattr(_STATE, self.flag.name, self.flag.value)
+      # `known_only=True` parses the flags absl actually defines (so any
+      # `--tokamax_*` flags on the command line still take effect) and ignores
+      # the rest instead of raising `UnrecognizedFlagError`. Tokamax is a
+      # library, so `sys.argv` may carry flags owned by the host program
+      # (pytest's `-s`, vLLM's CLI args, etc.) that absl does not recognize.
+      flags.FLAGS(sys.argv, known_only=True)
+    return self.flag.value if (v := self.config.value) is _DEFAULT else v
 
 
 autotuning_cache_miss_fallback = _ConfigOption(
@@ -87,5 +82,25 @@ cross_compile = _ConfigOption(
         " where kernels are lowered and compiled is not the same as the machine"
         " where they are run. `has_mosaic_gpu_support()` that check that the"
         " correct hardware is present.",
+    )
+)
+
+ignore_autotuning_cache = _ConfigOption(
+    flags.DEFINE_bool(
+        "tokamax_ignore_autotuning_cache",
+        False,
+        "If true, ignore the autotuning cache when looking for configs and"
+        " autotuning.",
+    )
+)
+
+disable_multi_core_mode = _ConfigOption(
+    flags.DEFINE_bool(
+        "tokamax_disable_multi_core_mode",
+        False,
+        "Temporary flag to disable multi-core execution in GMM/TGMM v2 kernels"
+        " and fall back to the legacy pl.pallas_call path to unblock jax.vmap."
+        " TODO: Revert this flag once Tokamax updates its JAX"
+        " version.",
     )
 )

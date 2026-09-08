@@ -13,6 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 
+import itertools
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -22,46 +24,33 @@ from tokamax._src.ops.linear_softmax_cross_entropy_loss import api
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import test_utils
 
 
+def _api_fwd_bwd_matches_reference_test_cases():
+  sizes = [
+      ("small", 1024, 512, 2048),
+      ("small_unaligned", 1024, 520, 2049),
+      ("medium", 4096, 1024, 4096),
+  ]
+  reductions = ["sum", "mean"]
+
+  for (size_name, b, h, v), reduction, impl in itertools.product(
+      sizes,
+      reductions,
+      list(api.IMPLEMENTATIONS.keys()) + [None],
+  ):
+    yield dict(
+        testcase_name=f"{size_name}_{reduction}_{impl}",
+        b_dim=b,
+        h_dim=h,
+        v_dim=v,
+        reduction=reduction,
+        test_impl=impl,
+        reference_impl="xla",
+    )
+
+
 class ApiTest(parameterized.TestCase):
 
-  @parameterized.named_parameters(
-      dict(
-          testcase_name="small_size_sum_reduction_test",
-          b_dim=1024,
-          h_dim=512,
-          v_dim=2048,
-          reduction="sum",
-          test_impl=None,
-          reference_impl="xla",
-      ),
-      dict(
-          testcase_name="medium_size_sum_reduction_test",
-          b_dim=4096,
-          h_dim=1024,
-          v_dim=4096,
-          reduction="sum",
-          test_impl=None,
-          reference_impl="xla",
-      ),
-      dict(
-          testcase_name="small_size_mean_reduction_test",
-          b_dim=1024,
-          h_dim=512,
-          v_dim=1024,
-          reduction="mean",
-          test_impl=None,
-          reference_impl="xla",
-      ),
-      dict(
-          testcase_name="medium_size_mean_reduction_test",
-          b_dim=4096,
-          h_dim=1024,
-          v_dim=4096,
-          reduction="mean",
-          test_impl=None,
-          reference_impl="xla",
-      ),
-  )
+  @parameterized.named_parameters(*_api_fwd_bwd_matches_reference_test_cases())
   def test_api_fwd_bwd_matches_reference(
       self,
       b_dim,
@@ -97,7 +86,6 @@ class ApiTest(parameterized.TestCase):
           h_dim=512,
           v_dim=2048,
           reduction="sum",
-          test_impl=None,
       ),
       dict(
           testcase_name="medium_sum_reduction_test",
@@ -105,7 +93,6 @@ class ApiTest(parameterized.TestCase):
           h_dim=1024,
           v_dim=4096,
           reduction="sum",
-          test_impl=None,
       ),
   )
   def test_correct_implementation_used(
@@ -114,7 +101,6 @@ class ApiTest(parameterized.TestCase):
       h_dim,
       v_dim,
       reduction,
-      test_impl,
   ):
     x, labels, w = test_utils.generate_random_data(
         jax.random.key(42), b_dim, h_dim, v_dim
@@ -129,17 +115,12 @@ class ApiTest(parameterized.TestCase):
                 "reduction",
                 "implementation",
             ],
-        ).lower(x, labels, w, reduction=reduction, implementation=test_impl),
+        ).lower(x, labels, w, reduction=reduction),
         include_xla_kernels=False,
     )
 
-    mosaic_tpu_impl = (
-        type(api.IMPLEMENTATIONS.get("mosaic_tpu"))
-        if jax.default_backend() == "tpu"
-        else None
-    )
-
-    if test_impl == "mosaic_tpu":
+    if jax.default_backend() == "tpu":
+      mosaic_tpu_impl = type(api.IMPLEMENTATIONS.get("mosaic_tpu"))
       self.assertIsInstance(opspecs[0].op, mosaic_tpu_impl)
     else:
       # CPU / GPU are using XLA implementation

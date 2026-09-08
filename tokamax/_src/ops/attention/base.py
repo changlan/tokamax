@@ -14,14 +14,13 @@
 # ==============================================================================
 """Base for attention ops."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 import dataclasses
 import functools
 import math
-import types
-from typing import Any, Literal, NotRequired, ParamSpec, TypeVar, TypedDict, cast, overload
+from typing import Any, Literal, NotRequired, TypedDict, cast, overload, override
+
 import jax
-from jax import export
 from jax.experimental import shard_map
 import jax.numpy as jnp
 from jax.typing import DTypeLike  # pylint: disable=g-importing-member
@@ -35,13 +34,13 @@ from tokamax._src import quantization
 from tokamax._src import shape as shape_lib
 from tokamax._src import utils
 from tokamax._src.ops import op
-from typing_extensions import override
 
 
 class AUTO:  # Used as a sentinel value.
   pass
 
 
+CanonicalPrecision = precision_lib.CanonicalPrecision
 QArray = qwix.QArray
 
 
@@ -103,19 +102,15 @@ class Mask:
       k_len_or_indices: int | Int[Array, "*#B #h t"],
   ) -> Bool[Array, "*#B #H #T #t"] | None:
     """Returns the mask as a boolean array."""
-    if isinstance(q_len_or_indices, int) or export.is_symbolic_dim(
-        q_len_or_indices
-    ):
-      q_indices = jnp.arange(q_len_or_indices)
-    else:
+    if isinstance(q_len_or_indices, jax.Array):
       q_indices = q_len_or_indices
-
-    if isinstance(k_len_or_indices, int) or export.is_symbolic_dim(
-        k_len_or_indices
-    ):
-      k_indices = jnp.arange(k_len_or_indices)
     else:
+      q_indices = jnp.arange(q_len_or_indices)
+
+    if isinstance(k_len_or_indices, jax.Array):
       k_indices = k_len_or_indices
+    else:
+      k_indices = jnp.arange(k_len_or_indices)
 
     q_indices = q_indices[..., None]
     k_indices = k_indices[..., None, :]
@@ -208,15 +203,13 @@ class PagingInfo:
   lengths: Int[Array, "*#b"]
 
 
-_Config = TypeVar("_Config")
-_Key = TypeVar("_Key")
 # The attention residuals come from the softmax calculation:
 # `(maximum softmax input values, softmax denominator)`.
-Residuals = tuple[Float[Array, "*B H T"], Float[Array, "*B H T"]]
+type Residuals = tuple[Float[Array, "*B H T"], Float[Array, "*B H T"]]
 
 
-class DotProductAttention(
-    op.Op[Any, Float[Array, "*B T H d"], Residuals, _Config, _Key]
+class DotProductAttention[C, K: Hashable](
+    op.Op[Any, Float[Array, "*B T H d"], Residuals, C, K]
 ):
   """Dot product attention function."""
 
@@ -275,7 +268,7 @@ class DotProductAttention(
       q_indices: Int[Array, "*#B #H T"] | None = ...,
       k_indices: Int[Array, "*#b #h t"] | None = ...,
       normalize_output: bool = ...,
-      return_residuals: Literal[True] = ...,
+      return_residuals: Literal[True],
   ) -> tuple[Float[Array, "*B T H d"], Residuals]:
     ...
 
@@ -450,7 +443,7 @@ class DotProductAttention(
             k_end=[*batch_axes, k_heads_axis, seq_q_axis],
         ),
         [*batch_axes, heads_axis, seq_q_axis, seq_k_axis],  # dropout_mask
-        PagingInfo([*batch_axes], [*batch_axes, None], [*k_batch_axes]),
+        PagingInfo([*batch_axes], [*batch_axes, None], [*k_batch_axes]),  # pyrefly: ignore[bad-argument-type]
         [*batch_axes, heads_axis, seq_q_axis],  # q_indices
         [*batch_axes, k_heads_axis, seq_k_axis],  # k_indices
     )
@@ -520,20 +513,16 @@ class DotProductAttention(
     if not isinstance(precision, tuple):
       precision = (precision, precision)
 
-    q_k_dot_precision, p_v_dot_precision = precision
-
-    if not isinstance(q_k_dot_precision, jax.lax.DotAlgorithmPreset):
-      q_k_dot_precision = precision_lib.to_dot_algorithm_preset(
-          q.dtype, k.dtype, q_k_dot_precision
-      )
-
-    if not isinstance(p_v_dot_precision, jax.lax.DotAlgorithmPreset):
-      p_v_dot_precision = precision_lib.to_dot_algorithm_preset(
-          v.dtype, v.dtype, p_v_dot_precision
-      )
+    precision = cast(
+        tuple[CanonicalPrecision, CanonicalPrecision],
+        tuple(map(precision_lib.canonicalize_precision, precision)),  # pyrefly: ignore[bad-argument-type]
+    )
 
     if logits_dtype is AUTO:
-      logits_dtype = q_k_dot_precision.accumulation_type
+      qk_prec = precision[0]
+      qk_prec = precision_lib.to_dot_algorithm_preset(q.dtype, k.dtype, qk_prec)
+      assert qk_prec.accumulation_type is not None
+      logits_dtype = qk_prec.accumulation_type
 
     if logits_scale is AUTO:
       logits_scale = 1 / math.sqrt(q.shape[-1])
@@ -548,7 +537,7 @@ class DotProductAttention(
         q,
         k,
         v,
-        precision=(q_k_dot_precision, p_v_dot_precision),
+        precision=precision,
         logits_dtype=jnp.dtype(logits_dtype),
         logits_scale=logits_scale,
         bias=bias,
@@ -571,7 +560,7 @@ class DotProductAttention(
       k: Float[Array | QArray, "*b t h D"],
       v: Float[Array | QArray, "*b t h d"],
       *,
-      precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+      precision: tuple[CanonicalPrecision, CanonicalPrecision],
       logits_dtype: jnp.dtype,
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
@@ -584,7 +573,7 @@ class DotProductAttention(
       k_indices: Int[Array, "*#b #h t"] | None,
       normalize_output: bool,
       return_residuals: bool,
-      config: _Config,
+      config: C,
   ) -> tuple[Float[Array, "*B T H d"], Residuals | None]:
     del config  # Unused.
 
@@ -597,6 +586,12 @@ class DotProductAttention(
         v = jnp.repeat(v, repeats, axis=-2)
 
     q_k_dot_precision, weights_v_dot_precision = precision
+    q_k_dot_precision = precision_lib.to_dot_algorithm_preset(
+        q.dtype, k.dtype, q_k_dot_precision
+    )
+    weights_v_dot_precision = precision_lib.to_dot_algorithm_preset(
+        v.dtype, v.dtype, weights_v_dot_precision
+    )
 
     logits = jnp.einsum(
         "...qhd,...khd->...hqk",
@@ -616,14 +611,13 @@ class DotProductAttention(
 
     q_len_or_indices = q.shape[-3] if q_indices is None else q_indices
     k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
-    mask = mask.as_array(q_len_or_indices, k_len_or_indices)
+    mask: jax.Array | None = mask.as_array(q_len_or_indices, k_len_or_indices)
 
     if mask is not None:
       # This is not `-inf` as this can lead to `NaN`s when a full softmax row is
       # masked (with stable softmax). This is because the maximum value for the
       # row will be `-inf`, leading to `(-inf) - (-inf)` in the softmax.
-      mask_value = float(jnp.finfo(logits.dtype).min)
-      logits = jnp.where(jnp.asarray(mask), logits, mask_value)
+      logits = jnp.where(mask, logits, float(jnp.finfo(logits.dtype).min))
 
     weights, softmax_residuals = _softmax(logits, normalize_output)
 
@@ -766,17 +760,13 @@ def unfold_q_sequence_heads(
   if residuals is None:
     return out, None
   reshape = shape_lib.einshape("...h(sg)->...(hg)s", s=orig_seq_len_q)
-  return out, tuple(map(reshape, residuals))
+  return out, cast(Residuals, tuple(map(reshape, residuals)))
 
 
-_P = ParamSpec("_P")
-_T = TypeVar("_T")
-
-
-def vmap_batch_dims(f: Callable[_P, _T]) -> Callable[_P, _T]:
+def vmap_batch_dims[**P, T](f: Callable[P, T]) -> Callable[P, T]:
   """Returns `f` vmapped over the batch dims of its first argument."""
 
-  def vmap(f, *args: _P.args, **kwargs: _P.kwargs):
+  def vmap(f, *args: P.args, **kwargs: P.kwargs):
     assert not kwargs
     for _ in cast(jax.Array, args[0]).shape[:-3]:
       f = batching.vmap_maybe_bcast(f, 0)
@@ -809,8 +799,8 @@ class DotProductAttentionGrads(TypedDict):
   bias: NotRequired[Float[Array, "*#B #H #T #t"] | None]
 
 
-class DotProductAttentionVjp(
-    op.Op[Any, DotProductAttentionGrads, types.NoneType, _Config, _Key]
+class DotProductAttentionVjp[C, K: Hashable](
+    op.Op[Any, DotProductAttentionGrads, None, C, K]
 ):
   """Dot product attention VJP."""
 
@@ -825,7 +815,7 @@ class DotProductAttentionVjp(
       k: Float[Array, "*b t h D"],
       v: Float[Array, "*b t h d"],
       *,
-      precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+      precision: tuple[CanonicalPrecision, CanonicalPrecision],
       logits_dtype: jnp.dtype,
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
@@ -838,7 +828,7 @@ class DotProductAttentionVjp(
       k_indices: Int[Array, "*#b #h t"] | None,
       normalize_output: bool,
       return_residuals: bool,
-      config: _Config,
+      config: C,
   ) -> tuple[DotProductAttentionGrads, None]:
     """Computes attention VJP."""
     del config  # Unused.
@@ -885,6 +875,7 @@ class DotProductAttentionVjp(
       return out, residuals_
 
     vjp = ad.get_vjp_taking_residuals(attend, q, k, v, bias)
+    assert vjp is not None
     residuals_ = (
         q,
         k,

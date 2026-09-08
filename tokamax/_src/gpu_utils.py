@@ -32,39 +32,32 @@ def _compute_capability(device: jax.Device | None = None) -> float | None:
   if device.platform != 'gpu':
     return None
 
-  return float(getattr(device, 'compute_capability', None))
+  cc = getattr(device, 'compute_capability', None)
+  return None if cc is None else float(cc)
+
+
+def _cc_between(
+    lower: float, upper: float, device: jax.Device | None = None
+) -> bool:
+  """Returns True if the device's compute capabilities is within [lower, upper)."""
+  if (cc := _compute_capability(device)) is None:
+    return False
+  return cc >= lower and cc < upper
 
 
 def is_sm80(device: jax.Device | None = None) -> bool:
   """Returns True if the device is an Ampere GPU and False otherwise."""
-
-  compute_capability = _compute_capability(device)
-  if compute_capability is None:
-    return False
-
-  # https://developer.nvidia.com/cuda-gpus
-  return 8 <= compute_capability < 9
+  return _cc_between(8.0, 9.0, device)
 
 
 def is_sm90(device: jax.Device | None = None) -> bool:
   """Returns True if the device is a Hopper GPU and False otherwise."""
-
-  compute_capability = _compute_capability(device)
-  if compute_capability is None:
-    return False
-
-  # https://developer.nvidia.com/cuda-gpus
-  return 9 <= compute_capability < 10
+  return _cc_between(9.0, 10.0, device)
 
 
 def is_sm100(device: jax.Device | None = None) -> bool:
   """Returns True if the device is a Blackwell GPU and False otherwise."""
-  compute_capability = _compute_capability(device)
-  if compute_capability is None:
-    return False
-
-  # https://developer.nvidia.com/cuda-gpus
-  return 10 <= compute_capability < 11
+  return _cc_between(10.0, 11.0, device)
 
 
 def has_mosaic_gpu_support(device: jax.Device | None = None) -> bool:
@@ -76,8 +69,8 @@ def has_mosaic_gpu_support(device: jax.Device | None = None) -> bool:
   if device.platform != 'gpu':
     return False
 
-  # Only currently supported for Hopper and above.
-  return float(device.compute_capability) >= 9.0
+  # Only supported for Ampere and above. SM80 support is experimental.
+  return float(device.compute_capability) >= 8.0
 
 
 def has_triton_support(device: jax.Device | None = None) -> bool:

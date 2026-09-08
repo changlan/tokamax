@@ -16,17 +16,18 @@
 
 import dataclasses
 import math
-from typing import Literal
+from typing import Literal, override
 
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
+from tokamax._src import config as config_lib
 from tokamax._src import jaxtyping
+from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
-from typing_extensions import override
 
 
 Mask = base.Mask
@@ -48,7 +49,7 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
       k: Float[Array | QArray, "*B t h D"],
       v: Float[Array | QArray, "*B t h d"],
       *,
-      precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+      precision: tuple[base.CanonicalPrecision, base.CanonicalPrecision],
       logits_dtype: jnp.dtype,
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
@@ -81,6 +82,9 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
       raise NotImplementedError("Paged attention not supported.")
 
     q, k, v = map(quantization.as_array, (q, k, v))
+    precision_str = str(
+        precision_lib.to_dot_algorithm_preset(q.dtype, k.dtype, precision[0])
+    )
 
     is_causal = False
     if q_indices is None and k_indices is None:
@@ -102,7 +106,7 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
 
     q_len_or_indices = q_indices if q_indices is not None else q.shape[-3]
     k_len_or_indices = k_indices if k_indices is not None else k.shape[-3]
-    mask = mask.as_array(q_len_or_indices, k_len_or_indices)
+    mask_ = mask.as_array(q_len_or_indices, k_len_or_indices)
 
     *batch, seq_len_q, num_heads, head_dim = q.shape
     *_, seq_len_k, _, head_dim_out = v.shape
@@ -119,7 +123,7 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
         x = jnp.broadcast_to(x, (*batch, *x.shape[len(batch) :]))
       return jax.lax.collapse(x, 0, len(batch))
 
-    q, k, v, bias, mask = map(flatten_batch, (q, k, v, bias, mask))
+    q, k, v, bias, mask_ = map(flatten_batch, (q, k, v, bias, mask_))
     q_seq_lengths = flatten_batch(q_seq_lengths, len(batch), True)
     kv_seq_lengths = flatten_batch(kv_seq_lengths, len(batch), True)
 
@@ -127,16 +131,17 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
     if self.implementation == "cudnn":
       if bias is not None:
         bias = jnp.broadcast_to(bias, (*bias.shape[:-2], seq_len_q, seq_len_k))
-      if mask is not None:
-        mask = jnp.broadcast_to(mask, (*mask.shape[:-2], seq_len_q, seq_len_k))
+      if mask_ is not None:
+        shape = (*mask_.shape[:-2], seq_len_q, seq_len_k)
+        mask_ = jnp.broadcast_to(mask_, shape)
 
-    with jax.default_matmul_precision(str(precision[0])):
+    with jax.default_matmul_precision(precision_str):
       out = jax.nn.dot_product_attention(
           q,
           k,
           v,
           bias=bias,
-          mask=mask,
+          mask=mask_,
           is_causal=is_causal,
           scale=logits_scale,
           query_seq_lengths=q_seq_lengths,
@@ -148,4 +153,8 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return self.implementation != "cudnn" or device.platform == "gpu"
+    return (
+        self.implementation != "cudnn"
+        or device.platform == "gpu"
+        or config_lib.cross_compile.value
+    )

@@ -16,7 +16,8 @@
 
 import dataclasses
 import itertools
-from typing import Any, ClassVar, TypeAlias
+from typing import Annotated, Any, ClassVar, override
+
 import immutabledict
 import jax
 import jax.experimental.pallas.tpu as pltpu
@@ -24,25 +25,27 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_tpu_common as common
 from tokamax._src.ops.attention import pallas_mosaic_tpu_vjp
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
-from typing_extensions import override
 
 
 QArray = base.QArray
 Residuals = base.Residuals
 PagingInfo = base.PagingInfo
-Key: TypeAlias = immutabledict.immutabledict[str, Any]
+type Key = immutabledict.immutabledict[str, Any]
 
 
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Config:
-  block_q: pydantic.conint(multiple_of=common.NUM_LANES, gt=0)
-  block_kv: pydantic.conint(multiple_of=common.NUM_LANES, gt=0)
-  block_kv_compute: pydantic.conint(multiple_of=common.NUM_LANES, gt=0)
+  block_q: Annotated[int, pydantic.Field(multiple_of=common.NUM_LANES, gt=0)]
+  block_kv: Annotated[int, pydantic.Field(multiple_of=common.NUM_LANES, gt=0)]
+  block_kv_compute: Annotated[
+      int, pydantic.Field(multiple_of=common.NUM_LANES, gt=0)
+  ]
   q_layout: splash.QKVLayout
   k_layout: splash.QKVLayout
   v_layout: splash.QKVLayout
@@ -79,7 +82,7 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
       k: Float[Array | QArray, "*B t h D"],
       v: Float[Array | QArray, "*B t h d"],
       *,
-      precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+      precision: tuple[base.CanonicalPrecision, base.CanonicalPrecision],
       logits_dtype: jnp.dtype,
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
@@ -107,6 +110,7 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
         mask=mask,
     )
 
+    q = quantization.as_array(q)
     q *= logits_scale
 
     orig_q_shape = q.shape
@@ -121,17 +125,15 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
     # the inputs, which introduces overhead.
     q, k, v = map(lambda x: jnp.swapaxes(x, 1, 2), (q, k, v))
 
-    is_mqa = num_q_heads != num_kv_heads
+    is_mqa = num_kv_heads == 1
     if num_q_heads % num_kv_heads:
       raise ValueError(f"{num_q_heads=} must be divisible by {num_kv_heads=}")
-    if is_mqa and num_kv_heads != 1:
-      raise NotImplementedError("Grouped query attention is not implemented.")
     splash_config = dataclasses.replace(
         splash.SplashConfig.get_default(),
         attn_logits_soft_cap=logits_soft_cap,
         **dataclasses.asdict(config),
     )
-    splash_fn = common.build_splash_kernel(
+    splash_maker, splash_mask = common.build_splash_kernel(
         mask=mask,
         splash_config=splash_config,
         q_seq_len=q_seq_len,
@@ -143,7 +145,13 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
       k = jnp.squeeze(k, axis=1)
       v = jnp.squeeze(v, axis=1)
 
-    splash_output = jax.vmap(splash_fn)(q, k, v)
+    def splash_fn(q, k, v, mask):
+      return splash_maker(mask=mask)(q, k, v)
+
+    mask_in_axes = 0 if len(splash_mask.shape) == 3 else None
+    splash_output = jax.vmap(splash_fn, in_axes=(0, 0, 0, mask_in_axes))(
+        q, k, v, splash_mask
+    )
 
     if return_residuals:
       out, stats = splash_output
@@ -185,7 +193,7 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
     q, k = ba.arguments['q'], ba.arguments['k']
     q_seq_len, kv_seq_len = q.shape[-3], k.shape[-3]
     # TODO: Add 8192 once autotuning bugs are fixed.
-    tiles = [128, 256, 512, 1024, 2048, 4096]
+    tiles = [256, 512, 1024, 2048, 4096]
     layouts = [splash.QKVLayout.HEAD_DIM_MINOR, splash.QKVLayout.SEQ_MINOR]
     schedulers = [True, False]
     config = set()
@@ -198,6 +206,18 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
         layouts,
         schedulers,
     ):
+      # TODO: For sparse masks smaller block sizes could give
+      # better performance.
+      if q_seq_len >= 1024 and bq < 1024:
+        continue
+      if kv_seq_len >= 1024 and bkv < 1024:
+        continue
+      if bkv_c > 1024:
+        continue
+      # Tile size >=4096 makes compile time > 15mins per config, which pushes
+      # single arg spec autotuning time to more than 1 hour.
+      if bq >= 4096 or bkv >= 4096:
+        continue
       if bkv % bkv_c == 0 and bq <= q_seq_len and bkv <= kv_seq_len:
         config.add(
             Config(

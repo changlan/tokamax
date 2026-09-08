@@ -15,9 +15,8 @@
 """Flash attention with Mosaic TPU VJP."""
 
 import dataclasses
-import functools
 import itertools
-from typing import Any, ClassVar, Final, TypeAlias
+from typing import Annotated, Any, ClassVar, override
 
 import immutabledict
 import jax
@@ -30,19 +29,25 @@ from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_tpu_common as common
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
-from typing_extensions import override
+
 
 QArray = base.QArray
 Residuals = base.Residuals
 PagingInfo = base.PagingInfo
-Key: TypeAlias = immutabledict.immutabledict[str, Any]
+type Key = immutabledict.immutabledict[str, Any]
 
 
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Config:
-  block_q_dkv: pydantic.conint(multiple_of=common.NUM_LANES, gt=0)
-  block_kv_dkv: pydantic.conint(multiple_of=common.NUM_LANES, gt=0)
-  block_kv_dkv_compute: pydantic.conint(multiple_of=common.NUM_LANES, gt=0)
+  block_q_dkv: Annotated[
+      int, pydantic.Field(multiple_of=common.NUM_LANES, gt=0)
+  ]
+  block_kv_dkv: Annotated[
+      int, pydantic.Field(multiple_of=common.NUM_LANES, gt=0)
+  ]
+  block_kv_dkv_compute: Annotated[
+      int, pydantic.Field(multiple_of=common.NUM_LANES, gt=0)
+  ]
   use_base2_exp: bool = True
 
   def __post_init__(self):
@@ -74,7 +79,7 @@ class PallasMosaicTpuFlashAttentionVjp(
       k: Float[Array, "*B t h D"],
       v: Float[Array, "*B t h d"],
       *,
-      precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+      precision: tuple[base.CanonicalPrecision, base.CanonicalPrecision],
       logits_dtype: jnp.dtype,
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
@@ -119,17 +124,15 @@ class PallasMosaicTpuFlashAttentionVjp(
         lambda x: jnp.swapaxes(x, 1, 2), (q_4d, k_4d, v_4d, dout_4d, out_4d)
     )
 
-    is_mqa = num_q_heads != num_kv_heads
+    is_mqa = num_kv_heads == 1
     if num_q_heads % num_kv_heads:
       raise ValueError(f"{num_q_heads=} must be divisible by {num_kv_heads=}")
-    if is_mqa and num_kv_heads != 1:
-      raise NotImplementedError("Grouped query attention is not implemented.")
     splash_config = dataclasses.replace(
         splash.SplashConfig.get_default(),
         attn_logits_soft_cap=logits_soft_cap,
         **dataclasses.asdict(config),
     )
-    splash_fn = common.build_splash_kernel(
+    splash_maker, splash_mask = common.build_splash_kernel(
         mask=mask,
         splash_config=splash_config,
         q_seq_len=q_seq_len,
@@ -145,38 +148,44 @@ class PallasMosaicTpuFlashAttentionVjp(
       k_splash, v_splash = k_swap, v_swap
 
     # Always in natural base.
-    lse = residuals[1]
+    _, lse = residuals
+
+    dstats = dict(logsumexp=None, max_logits=None)
+
     # BWD kernel expects in corresponding base.
     if config.use_base2_exp:
       lse = lse * splash.LOG2E
 
-    splash_fn_kwargs = splash_fn.kwargs
-    bwd_fn = functools.partial(
-        splash._splash_attention_bwd,  # pylint: disable=protected-access
-        True,  # save_residuals
-        splash_fn_kwargs["mask_value"],
-        is_mqa,
-        splash_fn_kwargs["config"],
-        splash_fn_kwargs["mask_function"],
-        splash_fn_kwargs["fwd_mask_sparsity"],
-        splash_fn_kwargs["dkv_mask_sparsity"],
-    )
+    res = (q_swap, k_splash, v_splash, None, None, out_swap, lse)
+    lse_in_axis = 0 if lse.ndim == 3 else None
+    res_in_axes = (0, 0, 0, None, None, 0, lse_in_axis)
 
-    res = (
-        q_swap,
-        k_splash,
-        v_splash,
-        None,
-        None,
-        out_swap,
-        lse,
-        splash_fn.dkv_mask_info,
-    )
-    res_in_axes = (0, 0, 0, None, None, 0, (0 if lse.ndim == 3 else None), None)
+    cotangents = (dout_swap, dstats)
+    dstats_in_axes = jax.tree.map(lambda x: lse_in_axis, dstats)
+    cotangents_in_axes = (0, dstats_in_axes)
+
+    def bwd_fn(res, cotangents, splash_mask):
+      splash_fn = splash_maker(mask=splash_mask)
+      splash_fn_kwargs = splash_fn.kwargs
+      # The trailing `None` is the dropout key: this op does not expose
+      # attention dropout, so the backward kernel regenerates no mask.
+      res = res + (splash_fn.dkv_mask_info, None)
+      return splash._splash_attention_bwd(  # pylint: disable=protected-access
+          True,
+          splash_fn_kwargs["mask_value"],
+          is_mqa,
+          splash_fn_kwargs["config"],
+          splash_fn_kwargs["mask_function"],
+          splash_fn_kwargs["fwd_mask_sparsity"],
+          splash_fn_kwargs["dkv_mask_sparsity"],
+          res,
+          cotangents,
+      )
+    mask_in_axes = 0 if len(splash_mask.shape) == 3 else None
     # vmap over batch dimension
-    _, _, dq, dk, dv, _, _, _ = jax.vmap(bwd_fn, in_axes=(res_in_axes, 0))(
-        res, dout_swap
-    )
+    _, _, dq, dk, dv, _, _, _, _ = jax.vmap(
+        bwd_fn, in_axes=(res_in_axes, cotangents_in_axes, mask_in_axes)
+    )(res, cotangents, splash_mask)
 
     dq = jnp.swapaxes(dq, 1, 2) * logits_scale
     if is_mqa:
@@ -203,7 +212,7 @@ class PallasMosaicTpuFlashAttentionVjp(
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    q, k = ba.args[3], ba.args[4]
+    q, k = ba.arguments['q'], ba.arguments['k']
     q_seq_len, kv_seq_len = q.shape[-3], k.shape[-3]
     # TODO: Add 256, 8192 once autotuning bugs are fixed.
     tiles = [512, 1024, 2048, 4096]
@@ -213,6 +222,18 @@ class PallasMosaicTpuFlashAttentionVjp(
         tiles,
         tiles,
     ):
+      # TODO: For sparse masks smaller block sizes could give
+      # better performance.
+      if q_seq_len >= 1024 and bq < 1024:
+        continue
+      if kv_seq_len >= 1024 and bkv < 1024:
+        continue
+      if bkv_c > 1024:
+        continue
+      # Tile size >=4096 makes compile time > 15mins per config, which pushes
+      # single arg spec autotuning time to more than 1 hour.
+      if bq >= 4096 or bkv >= 4096:
+        continue
       if bkv % bkv_c == 0 and bq <= q_seq_len and bkv <= kv_seq_len:
         configs.add(
             Config(

@@ -1,20 +1,60 @@
 name: Run Benchmarks
 
 on:
-  # Allow manual runs from the Actions tab for testing
   workflow_dispatch:
-
-  schedule:
-    - cron: "0 0 * * *"  # Runs at 00:00 UTC every day
+    inputs:
+      ab_mode:
+        description: "Run A/B comparison (baseline vs experiment)."
+        required: false
+        type: boolean
+        default: false
+      baseline_ref:
+        description: "Git ref for the baseline in A/B mode. Defaults to PR base or main."
+        required: false
+        type: string
+        default: ""
+      experiment_ref:
+        description: "Git ref for the experiment in A/B mode. Defaults to current commit SHA."
+        required: false
+        type: string
+        default: ""
+      benchmark_filter:
+        description: "Regex to filter by benchmark name (e.g., 'attention.*')."
+        required: false
+        type: string
+        default: ""
+      environment_filter:
+        description: "Regex to filter by environment configuration ID (e.g., 'b200.*')."
+        required: false
+        type: string
+        default: ""
+      custom_metadata:
+        description: "JSON string of metadata to append to the benchmark result. Overwrites static metadata from the registry but is overwritten by dynamic metadata from the workload."
+        required: false
+        type: string
+        default: "{}"
+      enable_xprof:
+        description: "Enable xprof trace collection."
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+  pull-requests: write
 
 jobs:
   run_benchmarks:
     name: Run Tokamax benchmarks
-    uses: google-ml-infra/actions/.github/workflows/run-benchmarks.yaml@41d4df7f511683b977b4fa80cece1a06fabc061d
+    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@aa854ba7bdb77966a9cc1a013417f1c1a208c4c0 # main
     with:
       registry_file: "tokamax/benchmarks/benchmark_registry.pbtxt"
-      workflow_type: "SCHEDULED"
-      ml_actions_ref: "41d4df7f511683b977b4fa80cece1a06fabc061d"
+      bap_ref: "aa854ba7bdb77966a9cc1a013417f1c1a208c4c0"
+      ab_mode: ${{ inputs.ab_mode }}
+      baseline_ref: ${{ inputs.baseline_ref }}
+      experiment_ref: ${{ inputs.experiment_ref }}
+      benchmark_filter: ${{ inputs.benchmark_filter }}
+      environment_filter: ${{ inputs.environment_filter }}
+      custom_metadata: ${{ inputs.custom_metadata }}
+      custom_env_vars: |
+        ${{ inputs.enable_xprof == true && 'TOKAMAX_DUMP_XPROF=true' || '' }}

@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 import functools
+import os
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -20,20 +21,25 @@ import chex
 import jax
 from jax import export
 import jax.numpy as jnp
-from tokamax import autotuning
 from tokamax._src import batching
 from tokamax._src import gpu_utils
+from tokamax._src import hlo_utils
 from tokamax._src import jaxtyping
 from tokamax._src import numerics
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops.attention import api
-
 
 _CUDNN_CUSTOM_CALL_TARGET = 'custom_call_target="__cudnn'
 
 
 class DotProductAttentionTest(parameterized.TestCase):
   IMPL = None
+
+  def setUp(self):
+    super().setUp()
+    if jax.default_backend() == 'gpu':
+      # TODO: Remove once Mosaic GPU support is fixed.
+      self.skipTest('Mosaic GPU support is broken.')
 
   # Tests derived from JAX `nn_test`.
   # pylint: disable=invalid-name
@@ -45,12 +51,6 @@ class DotProductAttentionTest(parameterized.TestCase):
   def test_dot_product_attention(self, dtype, group_num, use_vmap):
 
     if jax.default_backend() == 'tpu' and self.IMPL == 'mosaic':
-      # TODO: Remove once grouped attention is supported on Mosaic
-      # TPU attention.
-      if group_num == 2:
-        self.skipTest(
-            'Group attention is not supported on Mosaic TPU attention.'
-        )
       if dtype == jnp.float16:
         self.skipTest(
             'FP16 precision is not supported on Mosaic TPU attention.'
@@ -93,7 +93,7 @@ class DotProductAttentionTest(parameterized.TestCase):
     chex.assert_trees_all_close(dK_ans, dK_ref, rtol=0.01, atol=0.01)
     chex.assert_trees_all_close(dV_ans, dV_ref, rtol=0.01, atol=0.01)
 
-    args = autotuning.get_bound_args(sdpa_ans, q, k, v, bias, mask)
+    args = hlo_utils.get_bound_args(sdpa_ans, q, k, v, bias, mask)
     self.assertLen(args, 1)
 
     if self.IMPL is not None:
@@ -157,7 +157,7 @@ class DotProductAttentionTest(parameterized.TestCase):
           ('custom', 'padding'),
           ('bias', 'causal'),
           ('causal', 'sliding_window'),
-          ('causal', 'custom')
+          ('causal', 'custom'),
       ],
   )
   def testDotProductAttentionMask(self, mask_mode):
@@ -183,10 +183,7 @@ class DotProductAttentionTest(parameterized.TestCase):
 
     dtype = jnp.bfloat16
     cudnn_bias = self.IMPL == 'cudnn' and 'bias' in mask_mode
-    tpu_mosaic = self.IMPL == 'mosaic' and jax.default_backend() == 'tpu'
-    # TODO:Only unbatched boolean masks are supported on TPU
-    # Mosaic.
-    B, S, T, N, H = (1 if cudnn_bias or tpu_mosaic else 2), 256, 256, 4, 64
+    B, S, T, N, H = (1 if cudnn_bias else 2), 256, 256, 4, 64
 
     q = jax.ShapeDtypeStruct((B, T, N, H), dtype)
     k = jax.ShapeDtypeStruct((B, S, N, H), dtype)
@@ -204,7 +201,7 @@ class DotProductAttentionTest(parameterized.TestCase):
       # Use a checkerboard mask as the custom mask to ensure it differs from
       # a standard causal mask to test causal and custom together work.
       custom_mask = (jnp.arange(T)[:, None] + jnp.arange(S)[None, :]) % 2 == 0
-      mask = custom_mask[None, None, :, :]
+      mask = jnp.broadcast_to(custom_mask[None, None, :, :], (B, 1, T, S))
     if 'bias' in mask_mode:
       bias = jax.ShapeDtypeStruct((1, N, T, S), dtype)
     if 'sliding_window' in mask_mode:
@@ -245,7 +242,7 @@ class DotProductAttentionTest(parameterized.TestCase):
       )
       # The JAX implementation zeroes output rows in the padding region.
       if qs is not None:
-        mask = jnp.arange(0, T)[None, :] < q_seqlen[:, None]
+        mask = jnp.arange(0, T)[None, :] < qs[:, None]
         out *= mask[:, :, None, None]
       return out
 
@@ -323,6 +320,49 @@ class DotProductAttentionTest(parameterized.TestCase):
     _, dbias_ans, _ = bwd_ans(x, bias, mask)
     chex.assert_trees_all_close(dbias_ans, dbias_ref, rtol=0.25, atol=0.25)
 
+  @parameterized.parameters('fwd', 'fwd_bwd')
+  def test_memory_scaling(self, mode):
+    if self.IMPL in (None, 'cudnn'):
+      self.skipTest(
+          'Memory scaling guarantees not made for this implementation'
+      )
+    # TODO: Fwd+bwd pass for xla_chunked is O(N^2).
+    if self.IMPL == 'xla_chunked' and mode == 'fwd_bwd':
+      self.skipTest(
+          'Skip test. Memory scaling for fwd+bwd for xla_chunked is O(N^2).'
+      )
+    # TODO: Fwd+bwd pass for mosaic TPU is O(N^2).
+    if (
+        jax.default_backend() == 'tpu'
+        and self.IMPL == 'mosaic'
+        and mode == 'fwd_bwd'
+    ):
+      self.skipTest(
+          'Skip test. Memory scaling for fwd+bwd for mosaic TPU is O(N^2).'
+      )
+
+    seq_len = 1024
+    scale = 4
+    x = jnp.ones((1, seq_len, 16, 128), dtype=jnp.bfloat16)
+    x_scale = jnp.ones((1, seq_len * scale, 16, 128), dtype=jnp.bfloat16)
+
+    fwd_fn = lambda x: api.dot_product_attention(
+        x, x, x, implementation=self.IMPL
+    )
+    bwd_fn = lambda x: jax.vjp(fwd_fn, x)[1](x)
+    f = jax.jit(fwd_fn) if mode == 'fwd' else jax.jit(bwd_fn)
+
+    assert (mem0 := f.lower(x).compile().memory_analysis()) is not None
+    assert (mem1 := f.lower(x_scale).compile().memory_analysis()) is not None
+    mem_increase = mem1.peak_memory_in_bytes / mem0.peak_memory_in_bytes
+
+    if self.IMPL == 'xla':
+      self.assertBetween(
+          mem_increase, minv=(scale**2) * 0.5, maxv=(scale**2) * 1.5
+      )
+    else:
+      self.assertBetween(mem_increase, minv=(scale * 0.25), maxv=(scale * 1.5))
+
 
 # pylint: enable=invalid-name
 
@@ -334,6 +374,8 @@ class DotProductAttentionMosaicTest(DotProductAttentionTest):
     super().setUp()
     match jax.default_backend():
       case 'gpu':
+        # TODO: Remove once Mosaic GPU support is fixed.
+        self.skipTest('Mosaic GPU support is broken.')
         if not gpu_utils.has_mosaic_gpu_support() or gpu_utils.is_sm100():
           self.skipTest(
               'Skip test. Mosaic implementation is not supported on this'
@@ -364,13 +406,21 @@ class DotProductAttentionCudnnTest(DotProductAttentionTest):
     super().setUp()
     if jax.default_backend() != 'gpu':
       self.skipTest(f'cuDNN only supported on GPU, not {jax.default_backend()}')
+    if gpu_utils.is_sm100():
+      # cuDNN deterministic algorithms are not supported on Blackwell below 9.18.0.
+      xla_flags = os.environ.get('XLA_FLAGS', '')
+      if '--xla_gpu_deterministic_ops' in xla_flags.split():
+        self.skipTest(
+            'Deterministic cuDNN SDPA not supported on Blackwell with current'
+            ' cuDNN version.'
+        )
 
   def test_impl_in_hlo(self):
     fn = functools.partial(api.dot_product_attention, implementation=self.IMPL)
     x = jax.ShapeDtypeStruct((2, 256, 4, 64), dtype=jnp.bfloat16)
     lowered = jax.jit(fn).lower(x, x, x)
-    hlo_text = lowered.compiler_ir(dialect='hlo').as_hlo_text()
-    self.assertIn(_CUDNN_CUSTOM_CALL_TARGET, hlo_text)
+    self.assertIsNotNone(hlo := lowered.compiler_ir('hlo'))
+    self.assertIn(_CUDNN_CUSTOM_CALL_TARGET, hlo.as_hlo_text())
 
 
 class DotProductAttentionXlaTest(DotProductAttentionTest):

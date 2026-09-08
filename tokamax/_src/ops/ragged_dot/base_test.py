@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from typing import override
+
 from absl.testing import absltest
+from absl.testing import parameterized
 import jax
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import test_base
@@ -39,6 +42,21 @@ class RaggedDotWithExplicitVjpTest(test_base.RaggedDotTestBase):
     if jax.default_backend() == "tpu":
       self.skipTest("Disabled for now due to numeric issues.")
     super().setUp()
+
+  @override
+  def _test_bench(self, spec):
+    if "128_m16384" in self._testMethodName and jax.default_backend() == "gpu":
+      self.skipTest("OOMs on MiG slice.")
+    super()._test_bench(spec)
+
+
+class GenerateGroupSizesTest(parameterized.TestCase):
+
+  @parameterized.parameters((256, 4), (16, 64), (256, 4, (0.1, 0.2, 0.3, 0.4)))
+  def test_generate_group_sizes(self, m, num_groups, p=None):
+    group_sizes = base.generate_group_sizes(m=m, num_groups=num_groups, p=p)
+    self.assertLen(group_sizes, num_groups)
+    self.assertEqual(sum(group_sizes), m)
 
 
 if __name__ == "__main__":

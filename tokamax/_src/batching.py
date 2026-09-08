@@ -17,7 +17,7 @@
 from collections.abc import Callable, Sequence
 import functools
 import inspect
-from typing import Any, ParamSpec, TypeVar
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -25,8 +25,6 @@ import numpy as np
 from tokamax._src import utils
 
 
-_P = ParamSpec('_P')
-_T = TypeVar('_T')
 _zip = functools.partial(zip, strict=True)
 
 
@@ -38,13 +36,13 @@ def _broadcast_prefix(prefix_tree, full_tree):
   return result
 
 
-# TODO: `ParamSpec` -> `TypeVarTuple` when pytype supports it.
-def vmap_maybe_bcast(f: Callable[_P, _T], in_axes: Any) -> Callable[_P, _T]:
+def vmap_maybe_bcast[*Ts, R](
+    f: Callable[[*Ts], R], in_axes: Any
+) -> Callable[[*Ts], R]:
   """`vmap`s `f` over (possibly broadcast) axes of its arguments."""
 
   @functools.wraps(f)
-  def vmapped(*args: _P.args, **kwargs: _P.kwargs):
-    assert not kwargs
+  def vmapped(*args: *tuple[*Ts]) -> R:  # pylint: disable=g-one-element-tuple
     in_axes_flat = _broadcast_prefix(in_axes, args)
     args_flat, args_tree = jax.tree.flatten(args)
 
@@ -75,14 +73,13 @@ def _split_dim(x, axis, num_parts):
   return x.reshape(shape)
 
 
-def vmap_split(
-    f: Callable[_P, _T], in_axes: Any, *, num_parts: int
-) -> Callable[_P, _T]:
+def vmap_split[*Ts, R](
+    f: Callable[[*Ts], R], in_axes: Any, *, num_parts: int
+) -> Callable[[*Ts], R]:
   """`vmap`s `f` over (possibly broadcast) parts of axes of its arguments."""
 
   @functools.wraps(f)
-  def vmapped(*args: _P.args, **kwargs: _P.kwargs):
-    assert not kwargs
+  def vmapped(*args: *tuple[*Ts]) -> R:  # pylint: disable=g-one-element-tuple
     in_axes_flat = _broadcast_prefix(in_axes, args)
     args_flat, args_tree = jax.tree.flatten(args)
 
@@ -217,5 +214,6 @@ def capture_batched_args(fn: Callable[..., Any]) -> Callable[..., Any]:
   params['batched_args'] = params['batched_args'].replace(
       kind=inspect.Parameter.KEYWORD_ONLY, default=None
   )
-  wrapped.__signature__ = orig_sig.replace(parameters=tuple(params.values()))
+  sig = orig_sig.replace(parameters=tuple(params.values()))
+  setattr(wrapped, '__signature__', sig)
   return wrapped

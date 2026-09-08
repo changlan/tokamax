@@ -21,19 +21,18 @@ import inspect
 import re
 import types
 import typing
-from typing import Annotated, Any, Generic, TypeAlias, TypeVar, Union
+from typing import Annotated, Any, TypeAliasType, TypedDict, Union
 
 import immutabledict
 import jax
 from jax.experimental.pallas import fuser
-import jax.numpy as jnp
 import jaxtyping
+import ml_dtypes
 import numpy as np
 import pydantic
 import pydantic_core
 from pydantic_core import core_schema as cs
 from tokamax._src import batching
-from typing_extensions import TypedDict  # Required for Python <3.12.
 
 
 def _int_power_of_two(n: int) -> int:
@@ -42,7 +41,7 @@ def _int_power_of_two(n: int) -> int:
   return n
 
 
-PowerOfTwo: TypeAlias = Annotated[
+PowerOfTwo = Annotated[
     pydantic.PositiveInt, pydantic.AfterValidator(_int_power_of_two)
 ]
 
@@ -51,10 +50,17 @@ def _validate_np_dtype(x) -> np.dtype:
   return x if isinstance(x, np.dtype) else np.dtype(x)
 
 
-NumpyDtype: TypeAlias = Annotated[
+def _serialize_np_dtype(dtype) -> str:
+  try:
+    return dtype.name
+  except AttributeError:
+    return getattr(dtype, '__name__', str(dtype))
+
+
+type NumpyDtype = Annotated[
     np.dtype,
     pydantic.PlainValidator(_validate_np_dtype),
-    pydantic.PlainSerializer(lambda dtype: dtype.name),
+    pydantic.PlainSerializer(_serialize_np_dtype),
 ]
 
 
@@ -65,12 +71,29 @@ if not typing.TYPE_CHECKING:
   _ORIG_IMPORT_STRING_SERIALIZE = pydantic.ImportString._serialize  # pylint: disable=protected-access
 
   def _serialize(v: Any) -> str:
-    return v if (data := _ORIG_IMPORT_STRING_SERIALIZE(v)) is None else data
+    while True:
+      if (fun := getattr(v, '_fun', None)) is not None:
+        v = fun
+      elif (wrapped := getattr(v, '__wrapped__', None)) is not None:
+        v = wrapped
+      elif not isinstance(v, type) and hasattr(v, '__getstate__'):
+        state = v.__getstate__()
+        if isinstance(state, dict) and (fun := state.get('fun')) is not None:
+          v = fun
+        else:
+          break
+      else:
+        break
+    if (data := _ORIG_IMPORT_STRING_SERIALIZE(v)) is not None:
+      return data
+    if (module := getattr(v, '__module__', None)) is not None:
+      if name := getattr(v, '__qualname__', getattr(v, '__name__', None)):
+        return f'{module}.{name}'
+    return str(v)
 
   pydantic.ImportString._serialize = _serialize  # pylint: disable=protected-access
 
 
-# pytype: disable=invalid-annotation
 def annotate(ty: Any) -> Any:
   """Annotates types with serializers and validators, as necessary."""
   # Move `str` to the end of the union.
@@ -92,12 +115,16 @@ def annotate(ty: Any) -> Any:
   origin = typing.get_origin(ty) or ty
   if hasattr(origin, '__get_pydantic_core_schema__'):
     return ty
+  if isinstance(ty, TypeAliasType):
+    return TypeAliasType(
+        ty.__name__, annotate(ty.__value__), type_params=ty.__type_params__
+    )
   if origin is Annotated:
     return Annotated[annotate(ty.__origin__), *ty.__metadata__]
   if origin is Union or isinstance(ty, types.UnionType):
-    return Union[tuple(map(annotate, typing.get_args(ty)))]
+    return Union[tuple(map(annotate, typing.get_args(ty)))]  # pyrefly: ignore[not-a-type]
   if origin is tuple:
-    return tuple[tuple(map(annotate, typing.get_args(ty)))]
+    return tuple[tuple(map(annotate, typing.get_args(ty)))]  # pyrefly: ignore[not-a-type]
   if origin in (type, Callable):
     return pydantic.ImportString[ty]
   if origin is Mapping:
@@ -112,45 +139,69 @@ def annotate(ty: Any) -> Any:
   if origin is fuser.Fusion:
     # TODO: Add support for serializing `Fusion`s.
     return Annotated[ty, pydantic.PlainSerializer(str, return_type=str)]
+  if origin is jax.sharding.ManualAxisType:
+    def _parse_manual_axis_type(v: Any) -> Any:
+      if isinstance(v, jax.sharding.ManualAxisType):
+        return v
+      if isinstance(v, dict):
+        v = {k: frozenset(val) for k, val in v.items()}
+        return jax.sharding.ManualAxisType(**v)  # pyrefly: ignore[bad-argument-type]
+      return v
+
+    return Annotated[
+        ty,
+        pydantic.PlainSerializer(
+            lambda x: dict(
+                varying=list(x.varying),
+                unreduced=list(x.unreduced),
+                reduced=list(x.reduced),
+            ),
+            return_type=dict,
+        ),
+        pydantic.BeforeValidator(_parse_manual_axis_type),
+    ]
   if dataclasses.is_dataclass(origin):
     return Annotated[ty, Dataclass]
+
   return ty
 
 
-# pytype: enable=invalid-annotation
-
-
-_T = TypeVar('_T')
-
-
-class TypeAdapter(pydantic.TypeAdapter[_T], Generic[_T]):
+class TypeAdapter[T]:
   """`TypeAdapter` where serialization info is be passed to `dump_python`.
 
   The `mode` and `round_trip` attributes from the `SerializationInfo` are
   forwarded to the `dump_python` method of the underlying `TypeAdapter`.
   """
 
+  def __init__(self, type: type[T]):
+    self._impl = pydantic.TypeAdapter(type)
+
+  def dump_json(self, instance: T, /, **kwargs) -> bytes:
+    return self._impl.dump_json(instance, **kwargs)
+
   def dump_python(
-      self, instance: Any, info: pydantic.SerializationInfo, **kwargs
+      self, instance: T, /, info: pydantic.SerializationInfo, **kwargs
   ) -> Any:
     kwargs.setdefault('mode', info.mode)
     kwargs.setdefault('round_trip', info.round_trip)
-    return super().dump_python(instance, **kwargs)
+    return self._impl.dump_python(instance, **kwargs)
+
+  def validate_python(self, object: Any, /) -> T:
+    return self._impl.validate_python(object)
 
 
 get_adapter = functools.lru_cache(TypeAdapter)
 
 
-class AnyInstanceOf(Generic[_T]):  # `Generic` makes pytype happy.
+class AnyInstanceOf[T]:
   """Annotates a type, allowing serialization of any instance of the given type.
 
   The value is serialized with the type name, allowing it to be deserialized
   as the corresponding type.
   """
 
-  @classmethod
-  def __class_getitem__(cls, item: _T) -> _T:
-    return Annotated[item, cls()]
+  def __class_getitem__(cls, item: type[T]) -> type[T]:
+    return typing.cast(type[T], Annotated[item, cls()])
 
   @classmethod
   def __get_pydantic_core_schema__(cls, source, handler):
@@ -218,11 +269,16 @@ class ShapeDtype:
   PATTERN = re.compile(r'(.*?)(\[.*?\])(\{vmap_axes=(\[.*\])\})?')
   SHORT_DTYPE_NAMES_MAP = immutabledict.immutabledict(
       bool=bool,
-      i4=jnp.int4,
+      **(dict(i1=ml_dtypes.int1) if hasattr(ml_dtypes, 'int1') else {}),
+      i2=ml_dtypes.int2,
+      i4=ml_dtypes.int4,
       i8=np.int8,
       i16=np.int16,
       i32=np.int32,
       i64=np.int64,
+      **(dict(u1=ml_dtypes.uint1) if hasattr(ml_dtypes, 'uint1') else {}),
+      u2=ml_dtypes.uint2,
+      u4=ml_dtypes.uint4,
       u8=np.uint8,
       u16=np.uint16,
       u32=np.uint32,
@@ -230,7 +286,20 @@ class ShapeDtype:
       f16=np.float16,
       f32=np.float32,
       f64=np.float64,
-      bf16=jnp.bfloat16,
+      bf16=ml_dtypes.bfloat16,
+      f4_e2m1fn=ml_dtypes.float4_e2m1fn,
+      f6_e2m3fn=ml_dtypes.float6_e2m3fn,
+      f6_e3m2fn=ml_dtypes.float6_e3m2fn,
+      f8_e3m4=ml_dtypes.float8_e3m4,
+      f8_e4m3=ml_dtypes.float8_e4m3,
+      f8_e8m0fnu=ml_dtypes.float8_e8m0fnu,
+      f8_e4m3b11fnuz=ml_dtypes.float8_e4m3b11fnuz,
+      f8_e4m3fn=ml_dtypes.float8_e4m3fn,
+      f8_e4m3fnuz=ml_dtypes.float8_e4m3fnuz,
+      f8_e5m2=ml_dtypes.float8_e5m2,
+      f8_e5m2fnuz=ml_dtypes.float8_e5m2fnuz,
+      c64=np.complex64,
+      c128=np.complex128,
   )
 
   @classmethod
@@ -250,7 +319,14 @@ class ShapeDtype:
         return x
       s = jax.core.ShapedArray(x.shape, x.dtype).str_short(short_dtypes=True)
       if isinstance(x, batching.BatchedShapeDtype) and x.vmap_axes:
-        vmap_axes_str = str(vmap_axes_serializer.to_json(x.vmap_axes), 'utf-8')
+        try:
+          vmap_axes_str = str(
+              vmap_axes_serializer.to_json(x.vmap_axes), 'utf-8'
+          )
+        except pydantic_core.PydanticSerializationError:
+          # vmap_axes may contain symbolic dimensions (e.g. _DimExpr) that can't
+          # be serialized. Fall back to string representation.
+          vmap_axes_str = str(x.vmap_axes)
         return f'{s}{{vmap_axes={vmap_axes_str}}}'
       return s
 
@@ -286,9 +362,7 @@ class ShapeDtype:
     )
 
 
-def get_arg_spec_model(
-    name: str, signature: inspect.Signature
-) -> type[dict[str, Any]]:
+def get_arg_spec_model(name: str, signature: inspect.Signature) -> type[Any]:
   """Returns a new `TypedDict` type for the given `inspect.Signature`."""
   fields = {}
   for param_name, p in signature.parameters.items():
@@ -297,6 +371,6 @@ def get_arg_spec_model(
     else:
       annotation = annotate(p.annotation)
     fields[param_name] = annotation
-  ty = TypedDict(name, fields, total=False)  # pytype: disable=wrong-arg-types
+  ty = TypedDict(name, fields, total=False)  # pyrefly: ignore[invalid-argument]
   ty.__pydantic_config__ = pydantic.ConfigDict(arbitrary_types_allowed=True)
   return ty

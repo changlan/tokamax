@@ -16,19 +16,23 @@
 """The Linear Softmax Cross-Entropy Loss Op API."""
 
 from collections.abc import Callable, Sequence
-from typing import Literal, TypeAlias
+from typing import Literal
 import jax
-from jaxtyping import Array, Integer, Real, Scalar  # pylint: disable=g-multiple-import, g-importing-member
+from jaxtyping import Array, Integer, Real  # pylint: disable=g-multiple-import, g-importing-member
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import base
+from tokamax._src.ops.linear_softmax_cross_entropy_loss import chunked_xla
 
 
-Implementation: TypeAlias = Literal["mosaic_tpu", "xla"]
+type Implementation = Literal["mosaic_tpu", "xla", "chunked_xla"]
 
-IMPLEMENTATIONS = dict(xla=base.LinearSoftmaxCrossEntropyLoss())
+IMPLEMENTATIONS = dict(
+    xla=base.LinearSoftmaxCrossEntropyLoss(),
+    chunked_xla=chunked_xla.ChunkedXlaLinearSoftmaxCrossEntropyLoss(),
+)
 _DEFAULT_IMPLEMENTATION = ("xla",)
 
 try:
-  from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
   IMPLEMENTATIONS["mosaic_tpu"] = (
       pallas_mosaic_tpu.PallasMosaicTpuLinearSoftmaxCrossEntropyLoss()
@@ -44,20 +48,20 @@ def linear_softmax_cross_entropy_loss(
     labels: Integer[Array, "B"],
     weights: Real[Array, "H V"],
     *,
-    reduction: Literal["sum", "mean"] = "sum",
+    reduction: Literal["sum", "mean", "none"] = "sum",
     precision: jax.lax.PrecisionLike = None,
     implementation: (
         Implementation
         | Sequence[Implementation | Callable[..., jax.Array]]
         | None
     ) = None,
-) -> Real[Scalar, ""]:
+) -> Real[Array, "*"]:
   """The linear softmax cross-entropy loss op.
 
   The Linear Softmax Cross-Entropy Loss Op is a tokamax Op that performs a
   linear projection and cross entropy loss calculation
   `loss = -reduction(labels * log(softmax(X@W)))`
-  where reduction is either sum or mean.
+  where reduction is sum, mean, or none.
   This op uses the regular (unsafe) Cross-Entropy loss function
   (Like `optax.softmax_cross_entropy()`) so the logits `X@W` cannot be `-inf`
 
@@ -68,17 +72,18 @@ def linear_softmax_cross_entropy_loss(
     weights: The linear projection weight matrix in the dimension of (H, V)
       where V is the dimension of the output logits aka vocabulary size.
     reduction: The reduction method for the cross entropy loss. Can be set to
-      "sum" or "mean" explicitly.
+      "sum", "mean", or "none" explicitly.
     precision: The precision used for jax.lax.dot_general for the linear
       projection and gradient calculation.
     implementation: By default "None" will be used to pick the best available
-      backend. Can be set to "xla" or "mosaic_tpu" explicitly. The "mosaic_tpu"
-      implementation is memory efficient and has almost 0 additional buffer
-      overhead while the "xla" implementation needs to materialize the full
-      logits
+      backend. Can be set to "mosaic_tpu", "xla" or "chunked_xla" explicitly.
+      The "mosaic_tpu" and "chunked_xla" implementations are memory efficient
+      and have almost 0 additional buffer overhead while the "xla"
+      implementation needs to materialize the full logits.
 
   Returns:
-    The Cross-Entropy loss
+    The Cross-Entropy loss. If reduction is "none", returns loss of shape (B,).
+    Otherwise, returns a scalar loss.
 
   Raises:
     NotImplementedError: If the implementation is not supported.
@@ -103,9 +108,11 @@ def linear_softmax_cross_entropy_loss(
     else:
       raise ValueError(f"Unsupported implementation: {implementation}")
 
-  # Find out the best impelmentation based on the hardware.
+  # Find out the best implementation based on the hardware.
   errors = []
-  for impl in IMPLEMENTATIONS:
+  for impl in _DEFAULT_IMPLEMENTATION:
+    if impl not in IMPLEMENTATIONS:
+      continue
     try:
       loss = IMPLEMENTATIONS[impl](
           x,
@@ -115,7 +122,7 @@ def linear_softmax_cross_entropy_loss(
       )
       return loss
     except NotImplementedError as e:
-      if len(implementation) == 1:
+      if len(_DEFAULT_IMPLEMENTATION) == 1:
         raise
       errors.append(e)
 

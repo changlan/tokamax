@@ -15,9 +15,9 @@
 """`DotProductAttention` wrapper for `FlexAttention`."""
 
 import dataclasses
-from typing import Annotated
+import functools
+from typing import Annotated, override
 
-import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import qwix
@@ -26,7 +26,6 @@ from tokamax._src import pydantic
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base as attn_base
 from tokamax._src.ops.flex_attention import base
-from typing_extensions import override
 
 
 Mask = attn_base.Mask
@@ -49,7 +48,7 @@ class WrappedFlexAttention(attn_base.DotProductAttention[op.NullConfig, None]):
       k: Float[Array | QArray, "*B t h D"],
       v: Float[Array | QArray, "*B t h d"],
       *,
-      precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+      precision: tuple[base.CanonicalPrecision, base.CanonicalPrecision],
       logits_dtype: jnp.dtype,
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
@@ -85,7 +84,8 @@ class WrappedFlexAttention(attn_base.DotProductAttention[op.NullConfig, None]):
       mask = mask.as_array(q_indices, k_indices)
       return jnp.ones(shape, dtype=jnp.bool_) if mask is None else mask
 
-    out = self.impl(
+    fn = functools.partial(
+        self.impl,
         q,
         k,
         v,
@@ -95,6 +95,8 @@ class WrappedFlexAttention(attn_base.DotProductAttention[op.NullConfig, None]):
         dropout_mask=dropout_mask,
         dropout_rate=dropout_rate,
         normalize_output=normalize_output,
-        return_residuals=return_residuals,
     )
-    return out if return_residuals else (out, None)
+    if return_residuals:
+      out, residuals = fn(return_residuals=True)
+      return out, residuals
+    return fn(), None

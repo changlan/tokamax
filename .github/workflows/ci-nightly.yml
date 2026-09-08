@@ -27,16 +27,24 @@ jobs:
   tokamax-nightly-attention-tests:
     strategy:
       matrix:
+      # TODO: Re-enable B200 once it is supported.
         runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu', 'linux-x86-tpu7x-56-1tpu']
+        include:
+          - runner: 'linux-x86-a3-8g-h100-1gpu'
+            device: 'cuda'
+          - runner: 'linux-x86-ct6e-44-1tpu'
+            device: 'tpu'
+          - runner: 'linux-x86-tpu7x-56-1tpu'
+            device: 'tpu'
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
         shell: bash
-    container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15'
+    container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15'
     timeout-minutes: 600
     steps:
       - name: Checkout Tokamax
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
@@ -44,25 +52,36 @@ jobs:
         run: |
           python3.12 -m uv pip install --upgrade pip
           python3.12 -m uv pip --version
-          python3.12 -m uv pip install -e .[cuda,tpu,test]
+          python3.12 -m uv pip install -e .[${{ matrix.device }},test]
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with pytest
         run: |
           pytest -s --ignore-glob="*/test_base.py" --ignore-glob="*/experimental/*" tokamax/_src/ops/attention
-
+  # TODO: Re-enable ragged dot on b200 once it is supported.
+  # TODO: Re-enable B200 once it is supported.
   tokamax-nightly-ops-tests:
     strategy:
       matrix:
         runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu', 'linux-x86-tpu7x-56-1tpu']
+        include:
+          - runner: 'linux-x86-a3-8g-h100-1gpu'
+            device: 'cuda'
+            additional_ignore: ''
+          - runner: 'linux-x86-ct6e-44-1tpu'
+            device: 'tpu'
+            additional_ignore: ''
+          - runner: 'linux-x86-tpu7x-56-1tpu'
+            device: 'tpu'
+            additional_ignore: ''
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
         shell: bash
-    container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15'
+    container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15'
     timeout-minutes: 600
     steps:
       - name: Checkout Tokamax
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
@@ -70,25 +89,33 @@ jobs:
         run: |
           python3.12 -m uv pip install --upgrade pip
           python3.12 -m uv pip --version
-          python3.12 -m uv pip install -e .[cuda,tpu,test]
+          python3.12 -m uv pip install -e .[${{ matrix.device }},test]
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with pytest
         run: |
-          pytest -s --ignore-glob="*/test_base.py" --ignore-glob="*/experimental/*"  --ignore=tokamax/_src/ops/attention/ tokamax/_src/ops
+          pytest -s --ignore-glob="*/test_base.py" --ignore-glob="*/experimental/*"  --ignore=tokamax/_src/ops/attention/ ${{ matrix.additional_ignore }} tokamax/_src/ops
 
   tokamax-nightly-tests:
     strategy:
       matrix:
+        # TODO: Re-enable ragged dot on b200 once it is supported.
         runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu', 'linux-x86-tpu7x-56-1tpu']
+        include:
+          - runner: 'linux-x86-a3-8g-h100-1gpu'
+            device: 'cuda'
+          - runner: 'linux-x86-ct6e-44-1tpu'
+            device: 'tpu'
+          - runner: 'linux-x86-tpu7x-56-1tpu'
+            device: 'tpu'
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
         shell: bash
-    container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15'
+    container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15'
     timeout-minutes: 600
     steps:
       - name: Checkout Tokamax
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
@@ -96,7 +123,7 @@ jobs:
         run: |
           python3.12 -m uv pip install --upgrade pip
           python3.12 -m uv pip --version
-          python3.12 -m uv pip install -e .[cuda,tpu,test]
+          python3.12 -m uv pip install -e .[${{ matrix.device }},test]
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with pytest
         run: |

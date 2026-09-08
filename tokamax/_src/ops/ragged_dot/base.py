@@ -16,7 +16,7 @@
 
 from collections.abc import Callable, Sequence
 import dataclasses
-from typing import Any, TypeVar
+from typing import Any, override
 
 import jax
 from jax.experimental import checkify
@@ -27,17 +27,15 @@ import qwix
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op
-from typing_extensions import override
 
 
-_Config = TypeVar("_Config")
-_Key = TypeVar("_Key")
-Residuals = jax.Array | None
+# Type variables used below are defined in the generic class signature.
+type Residuals = jax.Array | None
 QArray = qwix.QArray
 AsQArray = quantization.AsQArray
 CanonicalPrecision = precision_lib.CanonicalPrecision
-_DotAlgorithmLike = jax.lax.DotAlgorithm | jax.lax.DotAlgorithmPreset
-ActivationFunction = Callable[[jax.Array], jax.Array] | None
+type _DotAlgorithmLike = jax.lax.DotAlgorithm | jax.lax.DotAlgorithmPreset
+type ActivationFunction = Callable[[jax.Array], jax.Array] | None
 
 DEFAULT_RAGGED_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
     dot_dimension_numbers=(([1], [1]), ([], [])),
@@ -60,7 +58,7 @@ _STATIC = dataclasses.field(metadata=dict(static=True))
 
 
 @jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(frozen=True, slots=True, init=False)
 class GroupSizes:
   """A group sizes array with representative values.
 
@@ -69,63 +67,202 @@ class GroupSizes:
   will vary from one step to the next). Instead, we serialize a representative
   distribution of group sizes. This allows `ragged_dot` to be benchmarked /
   autotuned with representative data.
+
+  Attributes:
+    value: The group sizes array.
+    repr_value_or_total_size: Either a representative value (sequence of group
+      sizes), or the total size (sum of group sizes). If an integer, the
+      representative value is generated from the total size and the number of
+      groups using `generate_group_sizes` with uniform probabilities.
   """
 
-  value: jax.Array | jax.ShapeDtypeStruct
-  representative_value: Sequence[int] = _STATIC
+  value: jax.Array | np.ndarray
+  repr_value_or_total_size: Sequence[int] | int = _STATIC
 
-  def __post_init__(self):
-    (num_groups,) = self.value.shape
-    representative_value = tuple(self.representative_value)
-
-    if len(representative_value) != num_groups:
-      raise ValueError(
-          "Representative value must have the same length as the group sizes."
-      )
-
-    if not isinstance(self.value, jax.Array):
-      value = np.asarray(representative_value, np.int32)
-      object.__setattr__(self, "value", value)
-
-    if not np.issubdtype(self.value.dtype, np.integer):
+  def __init__(
+      self,
+      value: jax.Array | np.ndarray | jax.ShapeDtypeStruct,
+      repr_value_or_total_size: Sequence[int] | int,
+  ):
+    if not np.issubdtype(value.dtype, np.integer):
       raise ValueError("Group sizes must be integers.")
 
-    object.__setattr__(self, "representative_value", representative_value)
+    (num_groups,) = value.shape
 
-  def __jax_array__(self):
-    return self.value
+    if not isinstance(repr_value_or_total_size, int):
+      if len(repr_value_or_total_size) != num_groups:
+        raise ValueError(
+            "Representative value must have same length as the group sizes."
+        )
+      repr_value_or_total_size = tuple(repr_value_or_total_size)
+
+    if not isinstance(value, (jax.Array, np.ndarray)):
+      if isinstance(repr_value_or_total_size, int):
+        m = repr_value_or_total_size
+        representative_value = generate_group_sizes(m=m, num_groups=num_groups)
+      else:
+        representative_value = repr_value_or_total_size
+
+      value = np.asarray(representative_value, value.dtype)
+
+    object.__setattr__(self, "value", value)
+    object.__setattr__(
+        self, "repr_value_or_total_size", repr_value_or_total_size
+    )
+
+  @property
+  def representative_value(self) -> tuple[int, ...]:
+    """The representative value."""
+    if isinstance(self.repr_value_or_total_size, int):
+      assert isinstance(self.value, np.ndarray)
+      return tuple(map(int, self.value))
+    return self.repr_value_or_total_size  # pyrefly: ignore[bad-return]
+
+  def __jax_array__(self) -> jax.Array:
+    return jnp.asarray(self.value)
 
   def __eq__(self, other) -> bool:
-    return isinstance(other, GroupSizes) and (
-        self.representative_value == other.representative_value
+    return (
+        isinstance(other, GroupSizes)
+        and self.value.shape == other.value.shape
+        and self.repr_value_or_total_size == other.repr_value_or_total_size
     )
 
   def __hash__(self) -> int:
-    return hash(self.representative_value)
+    return hash((self.value.shape, self.repr_value_or_total_size))
 
   @classmethod
   def __get_pydantic_core_schema__(cls, source, handler):
     del handler  # Unused.
     assert source is cls
-    serialize = lambda x: x.representative_value
-    validate = lambda x: cls(jax.ShapeDtypeStruct([len(x)], jnp.int32), x)  # pytype: disable=wrong-arg-types
+
+    def serialize(x: GroupSizes):
+      if isinstance(x.repr_value_or_total_size, int):
+        total_size = x.repr_value_or_total_size
+        return dict(num_groups=x.value.size, total_size=total_size)
+      return x.representative_value
+
+    validate_ints = lambda x: cls(jax.ShapeDtypeStruct([len(x)], jnp.int32), x)
     from_ints_schema = cs.chain_schema([
         cs.tuple_schema([cs.int_schema()], variadic_item_index=0),
-        cs.no_info_plain_validator_function(validate),
+        cs.no_info_plain_validator_function(validate_ints),
     ])
+
+    def validate_dict(x: dict[str, int]) -> GroupSizes:
+      return cls(
+          jax.ShapeDtypeStruct([x["num_groups"]], jnp.int32), x["total_size"]
+      )
+
+    from_dict_schema = cs.chain_schema([
+        cs.dict_schema(cs.str_schema(), cs.int_schema()),
+        cs.no_info_plain_validator_function(validate_dict),
+    ])
+
     instance_schema = cs.is_instance_schema(cls)
     return cs.json_or_python_schema(
-        json_schema=from_ints_schema,
-        python_schema=cs.union_schema([instance_schema, from_ints_schema]),
+        json_schema=cs.union_schema([from_ints_schema, from_dict_schema]),
+        python_schema=cs.union_schema(
+            [instance_schema, from_ints_schema, from_dict_schema]
+        ),
         serialization=cs.plain_serializer_function_ser_schema(serialize),
     )
 
 
+def generate_group_sizes(
+    *, m: int, num_groups: int, p: Sequence[float] | None = None, seed: int = 0
+) -> tuple[int, ...]:
+  """Returns random group sizes.
+
+  `m` samples are drawn (with replacement) from the range `[0, num_groups - 1]`.
+  The returned tuple contains the number of times each group was chosen.
+
+  These values can be passed as the `representative_value` to `GroupSizes`,
+  allowing for more realistic benchmarking / autotuning (as the default, evenly
+  split, group sizes are often unrealisticly performant).
+
+  Args:
+    m: The number of rows to assign into groups.
+    num_groups: The number of groups.
+    p: The probabilities to use for each group. If `None`, the probabilities are
+      uniform. See `numpy.random.Generator.choice` for more details.
+    seed: The seed for the random number generator.
+
+  Returns:
+    A tuple of group sizes. The expected size of group `i` is `p[i] * m` (where
+    `p[i] = 1 / num_groups` if `p` is `None`).
+  """
+  rng = np.random.default_rng(seed)
+  group_ids = rng.choice(num_groups, (m,), p=p, replace=True)
+  return tuple(map(int, np.bincount(group_ids, minlength=num_groups)))
+
+_QUANTIZED_DTYPES = (
+    jnp.float8_e4m3fn,
+    jnp.float8_e5m2,
+    jnp.float8_e4m3fnuz,
+    jnp.float8_e5m2fnuz,
+    jnp.float4_e2m1fn,
+    jnp.int8,
+    jnp.int4,
+)
+
+
+def _is_quantized(x: jax.Array) -> bool:
+  return x.dtype in _QUANTIZED_DTYPES
+
+
+def _dequantize_inputs(
+    lhs: jax.Array | QArray | AsQArray,
+    rhs: jax.Array | QArray | AsQArray,
+    rhs_scale: jax.Array | None,
+    out_dtype: jnp.dtype,
+    ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
+) -> tuple[jax.Array, jax.Array]:
+  lhs, rhs = map(quantization.as_array, (lhs, rhs))
+  if rhs_scale is None:
+    return lhs, rhs
+
+  # rhs_scale is a gmm v2 feature.
+  if _is_quantized(rhs) and rhs_scale is not None:
+    if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:
+      num_groups, k, n = rhs.shape
+      num_blocks = rhs_scale.shape[1]
+      block_size = k // num_blocks
+      rhs_reshaped = rhs.reshape(
+          (num_groups, num_blocks, block_size, n)
+      ).astype(jnp.float32)
+      rhs_dequant = (rhs_reshaped * rhs_scale.astype(jnp.float32)).reshape(
+          (num_groups, k, n)
+      )
+      rhs = rhs_dequant.astype(out_dtype)
+    elif ragged_dot_dimension_numbers == RAGGED_CONTRACTING_DOT_DIM_NUMS:
+      scale = rhs_scale.reshape(-1, rhs_scale.shape[-1]).astype(jnp.float32)
+      rhs = (rhs.astype(jnp.float32) * scale).astype(out_dtype)
+
+  return lhs, rhs
+
+
 @dataclasses.dataclass(frozen=True)
-class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
+class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
   """Ragged dot base class.
 
   For use in MegaBlocks-style models: https://arxiv.org/abs/2211.15841.
+
+  These parameters are GMM v2 specific:
+    rhs_scale: The rhs scale when rhs is quantized.
+    rhs_bias: The rhs bias: ragged_dot(lhs, rhs) + rhs_bias.
+    maybe_quantize_lhs: Quantize lhs if set to True and rhs is quantized.
+    lhs_scale: The lhs scale when maybe_quantize_lhs is True.
+    zero_initialize: Whether to initialize unvisited output
+      elements to zero. Defaults to True (standard behavior).
+    fuse_gateup_activation: fuse_gateup_activation basically fuses these two
+      steps:
+        - tmp = ragged_dot(lhs, [gate, up])  # concatenate gate and up on n-dim
+        - activate(tmp[:, :n]) * tmp[:, n:]
+      Currently supported activations are "silu", "gelu", and "swigluoai".
+      It is different from the `activation` parameter, which is applied to the
+      output of the ragged dot: activate(ragged_dot(lhs, rhs)).
+    lhs_quantization_dtype: The dtype to use for the lhs quantization.
+    rhs_quantization_dtype: The dtype to use for the rhs quantization.
   """
 
   _: dataclasses.KW_ONLY
@@ -144,21 +281,30 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       precision: jax.lax.PrecisionLike = None,
       preferred_element_type: jax.typing.DTypeLike | None = None,
       return_residuals: bool = False,
+      group_offset: jax.Array | None = None,
       activation: ActivationFunction | None = None,
+      manual_axis_type: jax.sharding.ManualAxisType | None = None,
+      rhs_scale: jax.Array | None = None,
+      rhs_bias: jax.Array | None = None,
+      maybe_quantize_lhs: bool = False,
+      lhs_scale: jax.Array | None = None,
+      zero_initialize: bool = True,
+      fuse_gateup_activation: str | None = None,
+      lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
+      rhs_quantization_dtype: jax.typing.DTypeLike | None = None,
   ) -> op.BoundArguments:
+
     if ragged_dot_dimension_numbers is None:
       # TODO: Support batch dims on LHS and/or RHS?
       ragged_dot_dimension_numbers = DEFAULT_RAGGED_DOT_DIM_NUMS
 
-    if isinstance(group_sizes, (tuple, list)):
+    if isinstance(group_sizes, Sequence):
       group_sizes = tuple(group_sizes)
       group_sizes = GroupSizes(jnp.array(group_sizes, jnp.int32), group_sizes)
 
-    # TODO: Create representative values for other ragged dot dim numbers.
     if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:
       if not isinstance(group_sizes, GroupSizes):
-        representative_sizes = (lhs.shape[0] // rhs.shape[0],) * rhs.shape[0]
-        group_sizes = GroupSizes(group_sizes, representative_sizes)
+        group_sizes = GroupSizes(group_sizes, lhs.shape[0])
 
       if self.checkify_group_sizes:
         gs = group_sizes.value
@@ -176,7 +322,17 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
         precision=precision_lib.canonicalize_precision(precision),
         preferred_element_type=preferred_element_type,
         return_residuals=return_residuals,
+        group_offset=group_offset,
         activation=activation,
+        manual_axis_type=manual_axis_type,
+        rhs_scale=rhs_scale,
+        rhs_bias=rhs_bias,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        lhs_scale=lhs_scale,
+        zero_initialize=zero_initialize,
+        fuse_gateup_activation=fuse_gateup_activation,
+        lhs_quantization_dtype=lhs_quantization_dtype,
+        rhs_quantization_dtype=rhs_quantization_dtype,
     )
 
   @override
@@ -190,23 +346,40 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       precision: CanonicalPrecision,
       preferred_element_type: jnp.dtype | None,
       return_residuals: bool,
-      config: _Config,
+      config: C,
       activation: ActivationFunction | None = None,
+      manual_axis_type: jax.sharding.ManualAxisType | None = None,
+      group_offset: jax.Array | None = None,
+      rhs_scale: jax.Array | None = None,
+      rhs_bias: jax.Array | None = None,
+      maybe_quantize_lhs: bool = False,
+      lhs_scale: jax.Array | None = None,
+      zero_initialize: bool = True,
+      fuse_gateup_activation: str | None = None,
+      lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
+      rhs_quantization_dtype: jax.typing.DTypeLike | None = None,
   ) -> tuple[jax.Array, Residuals]:
-    del config  # Unused.
+    del config, maybe_quantize_lhs, lhs_scale, zero_initialize
+    del lhs_quantization_dtype, rhs_quantization_dtype  # Unused.
 
-    lhs, rhs = map(quantization.as_array, (lhs, rhs))
+    # JAX/XLA does not implement group_offset.
+    if group_offset is not None:
+      raise NotImplementedError(
+          "The base XLA implementation does not support group_offset."
+      )
 
     if isinstance(group_sizes, GroupSizes):
-      group_sizes = jnp.array(group_sizes)
+      group_sizes = jnp.asarray(group_sizes.value)
+
+    out_dtype = preferred_element_type or jnp.result_type(lhs, rhs)
+    lhs, rhs = _dequantize_inputs(lhs, rhs, rhs_scale, out_dtype, ragged_dot_dimension_numbers)
 
     # NOTE: `preferred_element_type` changes the accumulation type when using
     # `jax.lax.Precision`. It would be easier to always convert the precision to
     # `DotAlgorithmPreset`, but `ragged_dot_general` doesn't yet support
     # `DotAlgorithmPreset` (https://github.com/jax-ml/jax/issues/32207).
     # TODO: Remove once the above is fixed.
-    out_dtype = preferred_element_type or jnp.result_type(lhs, rhs)
-    if not isinstance(precision, _DotAlgorithmLike):
+    if not isinstance(precision, _DotAlgorithmLike.__value__):
       is_integer = jnp.issubdtype(out_dtype, jnp.integer)
       acc_dtype = jnp.int32 if is_integer else jnp.float32
       preferred_element_type = jnp.promote_types(out_dtype, acc_dtype)
@@ -218,6 +391,27 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
         precision=precision,
         preferred_element_type=preferred_element_type,
     ).astype(out_dtype)
+
+    if rhs_bias is not None:
+      m = lhs.shape[0]
+      bias = rhs_bias[:, 0]
+      dot_out = dot_out + jnp.repeat(
+          bias, group_sizes, axis=0, total_repeat_length=m
+      )
+
+    if fuse_gateup_activation is not None:
+      gate, up = jnp.split(dot_out, 2, axis=-1)
+      match fuse_gateup_activation:
+        case "silu":
+          dot_out = jax.nn.silu(gate) * up
+        case "gelu":
+          dot_out = jax.nn.gelu(gate) * up
+        case "gelu_tanh":
+          dot_out = jax.nn.gelu(gate, approximate=True) * up
+        case _:
+          raise NotImplementedError(
+              f"Unsupported fused activation: {fuse_gateup_activation}"
+          )
 
     residuals = dot_out
     if activation is not None:
@@ -240,9 +434,42 @@ def vjp(
     activation: ActivationFunction | None = None,
     dlhs_ragged_dot: Callable[..., jax.Array] = RaggedDot(),
     drhs_ragged_dot: Callable[..., jax.Array] = RaggedDot(),
+    # `manual_axis_type` is not used, but is expected by vjp.
+    manual_axis_type: jax.sharding.ManualAxisType | None = None,
+    # The following are forward-only features (forwarded here by the op
+    # framework because they are part of `bind`). The backward path does not
+    # support quantized/biased/fused gradients, so they must be at defaults and
+    # are not propagated to the `dlhs`/`drhs` sub-calls.
+    group_offset: jax.Array | None = None,
+    rhs_scale: jax.Array | None = None,
+    rhs_bias: jax.Array | None = None,
+    maybe_quantize_lhs: bool = False,
+    lhs_scale: jax.Array | None = None,
+    zero_initialize: bool = True,
+    fuse_gateup_activation: str | None = None,
+    lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
+    rhs_quantization_dtype: jax.typing.DTypeLike | None = None,
 ) -> tuple[jax.Array, jax.Array]:
   """Ragged dot VJP."""
   del out, preferred_element_type  # Unused.
+
+  if (
+      group_offset is not None
+      or rhs_scale is not None
+      or rhs_bias is not None
+      or maybe_quantize_lhs
+      or lhs_scale is not None
+      or not zero_initialize
+      or fuse_gateup_activation is not None
+      or lhs_quantization_dtype is not None
+      or rhs_quantization_dtype is not None
+  ):
+    raise NotImplementedError(
+        "group_offset, rhs_scale, rhs_bias, maybe_quantize_lhs, lhs_scale,"
+        " zero_initialize, fuse_gateup_activation, lhs_quantization_dtype,"
+        " rhs_quantization_dtype are not supported on the ragged_dot backward"
+        " path for now."
+    )
 
   if activation is not None:
     _, activation_grad_fn = jax.vjp(activation, residuals)
@@ -265,6 +492,7 @@ def vjp(
 
   dot_dim_nums = ((dout_rhs_kept, rhs_kept), (dout_batch, rhs_batch))
   dout_ragged = [(len(dout_batch) + lhs_kept.index(d)) for d in lhs_ragged]
+
   dlhs = dlhs_ragged_dot(
       dout,
       rhs,
@@ -276,6 +504,7 @@ def vjp(
       ),
       precision=precision,
       preferred_element_type=lhs.dtype,
+      manual_axis_type=jax.typeof(lhs).manual_axis_type.to_ct_mat(),
   )
 
   dot_dim_nums = ((lhs_kept, dout_lhs_kept), (lhs_batch, dout_batch))
@@ -290,5 +519,6 @@ def vjp(
       ),
       precision=precision,
       preferred_element_type=rhs.dtype,
+      manual_axis_type=jax.typeof(rhs).manual_axis_type.to_ct_mat(),
   )
   return dlhs, drhs

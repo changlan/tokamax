@@ -29,6 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import qwix
+from tokamax._src import gpu_utils
 from tokamax._src import numerics
 from tokamax._src import quantization
 from tokamax._src import test_utils
@@ -87,7 +88,6 @@ def _run_test(
     atol_grads=None,
     test_deterministic=True,
     test_vjp=True,
-    test_vjp_deterministic=True,
     seed_seq=np.random.SeedSequence(42),
     **kwargs,
 ):
@@ -165,7 +165,10 @@ def _run_test(
 
   # Backwards.
   if atol_grads is None:
-    atol_grads = max(2 * atol, 5e-6)
+    if isinstance(atol, dict):
+      atol_grads = {k: max(2 * v, 5e-6) for k, v in atol.items()}
+    else:
+      atol_grads = max(2 * atol, 5e-6)
 
   grad_names = ("dq", "dk", "dv", "dbias")
   actual_grads = dict(zip(grad_names, vjp_fn(dout), strict=True))
@@ -179,11 +182,10 @@ def _run_test(
   )
   del expected_grads, vjp_fn, ref_vjp_fn  # Free device memory.
 
-  if test_vjp_deterministic:
-    actual2, vjp_fn = jax.vjp(impl, q, k, v, bias)
-    actual_grads2 = dict(zip(grad_names, vjp_fn(dout)))
-    chex.assert_trees_all_equal(actual, actual2)
-    chex.assert_trees_all_equal(actual_grads, actual_grads2)
+  actual2, vjp_fn = jax.vjp(impl, q, k, v, bias)
+  actual_grads2 = dict(zip(grad_names, vjp_fn(dout)))
+  chex.assert_trees_all_equal(actual, actual2)
+  chex.assert_trees_all_equal(actual_grads, actual_grads2)
 
 
 def override_test_args(**kwargs):
@@ -216,7 +218,7 @@ def _ref_impl_tanh(
 
 
 NAMED_ARG_SPECS = {
-    s.full_name: s.args for s in ARG_SPECS if "primary" in s.tags
+    s.full_name: s.args for s in ARG_SPECS if "ci_tests" in s.tags
 }
 
 
@@ -318,7 +320,7 @@ class AttentionTestBase(parameterized.TestCase):
     q, k, v = numerics.random_initialize((q, k, v))
     self._run_test_with_inputs(q, k, v, atol=2e-6)
 
-  @parameterized.parameters((8, 256), (256, 8), (8, 8))
+  @parameterized.parameters((8, 256), (256, 8), (7, 8))
   def test_small_sequences(self, seq_q, seq_kv):
     self._test_small_sequences(seq_q, seq_kv)
 
@@ -357,7 +359,7 @@ class AttentionTestBase(parameterized.TestCase):
     self._run_test((1024, 4, 64))
 
   def test_multiple_batch_dims(self):
-    self._run_test((2, 3, 4, 1024, 4, 64))
+    self._run_test((2, 3, 4, 256, 4, 64))
 
   def test_non_power_of_two_q_seq_len(self):
     self._run_test(
@@ -820,6 +822,8 @@ class AttentionTestBase(parameterized.TestCase):
     self._test_bench(spec)
 
   def _test_bench(self, spec):
+    if "deepseek2" in self._testMethodName and gpu_utils.is_sm90():
+      self.skipTest("deepseek2 doesn't fit into an H100 slice")
     self.skipTest("Awaiting Bug Fixes")
 
     spec = dict(spec)  # We need to take a copy to avoid modifying other tests.

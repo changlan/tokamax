@@ -16,7 +16,7 @@
 
 import dataclasses
 import functools
-from typing import ClassVar
+from typing import ClassVar, override
 
 import jax
 from jax.experimental import pallas as pl
@@ -24,14 +24,14 @@ from jax.experimental.pallas import triton as plgpu
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
-from tokamax._src import batching
 from tokamax._src import gpu_utils
 from tokamax._src import jaxtyping
+from tokamax._src import precision as precision_lib
 from tokamax._src import pydantic as pydantic_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.pallas import block
-from typing_extensions import override
+
 
 Mask = base.Mask
 Residuals = base.Residuals
@@ -89,7 +89,7 @@ def _bwd_dkdv(
     # Load m before computing qk to reduce pipeline stall.
     m = m_ref.at[span_m].load()
     l = l_ref.at[span_m].load(other=float(jnp.finfo(jnp.float32).tiny))
-    sT = pl.dot(k, q.T, precision=q_k_dot_precision).astype(logits_dtype)
+    sT = plgpu.dot(k, q.T, precision=q_k_dot_precision).astype(logits_dtype)
 
     if bias_ref is not None:
       nonlocal bias
@@ -113,9 +113,9 @@ def _bwd_dkdv(
 
     pT = jnp.exp(sT - m) / l
     do = do_ref.at[span_m].load()
-    dv += pl.dot(pT.astype(do.dtype), do, precision=weights_v_dot_precision)
+    dv += plgpu.dot(pT.astype(do.dtype), do, precision=weights_v_dot_precision)
     delta = delta_ref.at[span_m].load()
-    dpT = pl.dot(v, do.T, precision=weights_v_dot_precision) - delta
+    dpT = plgpu.dot(v, do.T, precision=weights_v_dot_precision) - delta
     dsT = pT * dpT
 
     # If we have an attention mask, it is possible that the entire row is
@@ -128,7 +128,7 @@ def _bwd_dkdv(
     if ds_ref is not None:
       ds_ref.at[span_m, span_n].store(dsT.T.astype(ds_ref.dtype))
 
-    dk += pl.dot(dsT.astype(q.dtype), q, precision=q_k_dot_precision)
+    dk += plgpu.dot(dsT.astype(q.dtype), q, precision=q_k_dot_precision)
     return dk, dv
 
   return jax.lax.fori_loop(lo, hi, body, (dk, dv))
@@ -179,7 +179,7 @@ def _bwd_dq(
     span_n = pl.ds(curr_n, block_n2)
     k = k_ref.at[span_n].load()
     v = v_ref.at[span_n].load()
-    s = pl.dot(q, k.T, precision=q_k_dot_precision).astype(logits_dtype)
+    s = plgpu.dot(q, k.T, precision=q_k_dot_precision).astype(logits_dtype)
 
     if bias_ref is not None:
       nonlocal bias
@@ -200,9 +200,9 @@ def _bwd_dq(
       offs_n = curr_n + jnp.arange(0, block_n2)
       p = jnp.where(offs_m[:, None] >= offs_n[None, :], p, 0.0)
 
-    dp = pl.dot(do, v.T, precision=weights_v_dot_precision) - delta
+    dp = plgpu.dot(do, v.T, precision=weights_v_dot_precision) - delta
     ds = p * dp
-    return dq + pl.dot(ds.astype(k.dtype), k, precision=q_k_dot_precision)
+    return dq + plgpu.dot(ds.astype(k.dtype), k, precision=q_k_dot_precision)
 
   return jax.lax.fori_loop(lo, hi, body, dq)
 
@@ -502,7 +502,7 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
       k: Float[Array, "*B t h D"],
       v: Float[Array, "*B t h d"],
       *,
-      precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+      precision: tuple[base.CanonicalPrecision, base.CanonicalPrecision],
       logits_dtype: jnp.dtype,
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
@@ -527,20 +527,22 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
       raise NotImplementedError("Paged attention not supported.")
 
     is_causal = False
-    if mask is not None:
+    if mask is None:
+      mask_ = None
+    else:
       if q_indices is None and k_indices is None:
         mask, is_causal = mask.take("is_causal")
 
       q_len_or_indices = q.shape[-3] if q_indices is None else q_indices
       k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
-      mask = mask.as_array(q_len_or_indices, k_len_or_indices)
+      mask_ = mask.as_array(q_len_or_indices, k_len_or_indices)
 
     def broadcast_to_rank(x, rank):
       return None if x is None else jax.lax.broadcast_to_rank(x, rank)
 
     orig_bias_shape = None if bias is None else bias.shape
     bias = broadcast_to_rank(bias, q.ndim)
-    mask = broadcast_to_rank(mask, q.ndim)
+    mask_ = broadcast_to_rank(mask_, q.ndim)
     dropout_mask = broadcast_to_rank(dropout_mask, q.ndim)
 
     if bias is None:
@@ -553,6 +555,12 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
       ds_dtype = self.dbias_intermediate_dtype
 
     q_k_dot_precision, weights_v_dot_precision = precision
+    q_k_dot_precision = precision_lib.to_dot_algorithm_preset(
+        q.dtype, k.dtype, q_k_dot_precision
+    )
+    weights_v_dot_precision = precision_lib.to_dot_algorithm_preset(
+        v.dtype, v.dtype, weights_v_dot_precision
+    )
     f = functools.partial(
         _bwd,
         is_causal=is_causal,
@@ -567,10 +575,11 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
     )
     f = base.vmap_batch_dims(f)
 
-    dq, dk, dv, ds = f(q, k, v, bias, mask, dropout_mask, residuals, out, dout)
+    dq, dk, dv, ds = f(q, k, v, bias, mask_, dropout_mask, residuals, out, dout)
     if bias is None:
       dbias = None
     else:
+      assert ds is not None
       broadcast_bias_axes = [i for i, d in enumerate(bias.shape) if d == 1]
       dbias = jnp.sum(ds, axis=broadcast_bias_axes)
       dbias = dbias.astype(bias.dtype).reshape(orig_bias_shape)
@@ -593,7 +602,22 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
   # TODO: Implement an autotuning search space.
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    return set()
+    configs = set()
+    for block_m in [16, 32, 64, 128, 256]:
+      for block_n in [16, 32, 64, 128, 256]:
+        for num_warps in [2, 4]:
+          for num_stages in [1, 2, 3, 4]:
+            configs.add(
+                Config(
+                    block_m1=block_m,
+                    block_m2=block_m,
+                    block_n1=block_n,
+                    block_n2=block_n,
+                    num_warps=num_warps,
+                    num_stages=num_stages,
+                )
+            )
+    return configs
 
   @override
   def supported_on(self, device: jax.Device) -> bool:

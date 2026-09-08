@@ -89,7 +89,7 @@ class BenchmarkingTest(parameterized.TestCase):
               dtype=jnp.float32,
           )
       }
-      golden_vjp = [
+      golden_vjp = (
           jnp.array(
               [[11.864799, -3.979468], [-10.16194, 5.627968]],
               dtype=jnp.float32,
@@ -102,7 +102,7 @@ class BenchmarkingTest(parameterized.TestCase):
               [[19.885725, 5.087355], [-6.428973, 0.18801]],
               dtype=jnp.float32,
           ),
-      ]
+      )
       # Tests against goldens ensures that initialization is constant over
       # time. Tests both forward and backward consistency.
       chex.assert_trees_all_close(out_fwd_vjp, golden_out, rtol=1e-4)
@@ -179,10 +179,12 @@ class BenchmarkingTest(parameterized.TestCase):
 
     kwargs = {'x': jnp.ones((512, 512))}
     f, x = benchmarking.standardize_function(f, kwargs=kwargs)
-    run = benchmarking.compile_benchmark(f, x)
-    bench = run(x, method='wallclock', iterations=1)
+    bench = benchmarking.benchmark(
+        f, x, method='wallclock', iterations=1
+    )
     time_sleep_ms = time_sleep_s * 1000
     self.assertGreaterEqual(bench.median_evaluation_time_ms, time_sleep_ms)
+    self.assertLen(bench.evaluation_times_ms, 1)
 
   def test_xprof_profile_session(self):
     def f(x):
@@ -213,6 +215,21 @@ class BenchmarkingTest(parameterized.TestCase):
         jax.block_until_ready(f(x))
       assert profile.total_op_time.total_seconds() > 0  # check is nonzero
       self.assertIsNone(profile.xprof_url)
+
+    with self.subTest('Include only all.'):
+      with benchmarking.XprofProfileSession(
+          hermetic=True, event_filter_regex='.*'
+      ) as profile:
+        jax.block_until_ready(f(x))
+      self.assertGreater(profile.total_op_time.total_seconds(), 0)
+
+    with self.subTest('Include only none.'):
+      with benchmarking.XprofProfileSession(
+          hermetic=True, event_filter_regex='non_existent_regex'
+      ) as profile:
+        jax.block_until_ready(f(x))
+      with self.assertRaises(ValueError):
+        _ = profile.total_op_time
 
   def test_xprof_profile_session_exception(self):
     with benchmarking.XprofProfileSession(hermetic=True) as profile:

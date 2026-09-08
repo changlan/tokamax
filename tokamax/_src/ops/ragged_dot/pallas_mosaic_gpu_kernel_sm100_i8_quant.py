@@ -38,10 +38,10 @@ _MAIN_WG = _DEQ_WG
 # Scale ACC and Store
 _STORE_WG = _MAIN_WG + 1
 # Warp in main WarpGroup
-_MMA_WARP = _MAIN_WG * 4
-_W_TMA_WARP = _MAIN_WG * 4 + 1
-_X_TMA_WARP = _MAIN_WG * 4 + 2
-_SCALE_TMA_WARP = _MAIN_WG * 4 + 3
+_MMA_WARP = 0
+_W_TMA_WARP = 1
+_X_TMA_WARP = 2
+_SCALE_TMA_WARP = 3
 _TMEM = plgpu.Layout.TCGEN05_TMEM_NATIVE
 _TCGEN05 = plgpu.Layout.TCGEN05
 _TCGEN05_COL = _TCGEN05.reduce(0)
@@ -226,8 +226,9 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
 
   m_iters = pl.cdiv(m, block_m) + num_groups - 1
   n_iters = pl.cdiv(n, block_n * _DEQ_WG)
+  align_tile = 8
   group_info = common.GroupInfo.create_aligned(
-      group_sizes, block_m, m_iters, noops_at_end=False
+      group_sizes, block_m, m_iters, align_tile
   )
 
   def kernel(*refs, scoped):
@@ -236,7 +237,6 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
         x_scales_gmem,
         w_gmem,
         w_scales_gmem,
-        _,
         group_id_gmem,
         start_within_block_gmem,
         actual_size_gmem,
@@ -281,6 +281,7 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
       start_within_block = start_within_block_gmem[tid_m]
       actual_size = actual_size_gmem[tid_m]
       block_start = block_start_gmem[tid_m]
+      block_start = pl.multiple_of(block_start, align_tile)
       slice_m = pl.ds(block_start, block_m)
       slice_n = lambda i: pl.ds(
           tid_n * block_n * _DEQ_WG + i * block_n + cluster_idx * tile_n, tile_n
@@ -295,9 +296,8 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
         def _():
           plgpu.set_max_registers(104, action="decrease")
 
-          @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
-          def _per_warp():
-            warp_id = lax.axis_index("warp")
+          @plgpu.warp_map
+          def _per_warp(warp_id):
 
             @pl.when(warp_id == _W_TMA_WARP)
             def w_tma_warp():
@@ -338,7 +338,9 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
                     ],
                     x_smem.at[slot],
                     x_tma_barrier.at[slot],
-                    partitioned_axis=0 if collective else None,
+                    leader_tracked=plgpu.CopyPartition.PARTITIONED(0)
+                    if collective
+                    else None,
                     collective_axes="x" if collective else None,
                 )
 
@@ -424,7 +426,6 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
             with jax.named_scope("S->R"):
               w = plgpu.load(
                   w_smem.at[wg * num_stages + slot],
-                  (),
                   layout=_TMEM(8),
                   optimized=False,
               )
@@ -468,23 +469,21 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
             slot = lax.rem(global_ki, num_stages)
             with jax.named_scope("[scale]load"):
               x_scale = plgpu.load(
-                  x_scales_gmem,
-                  (
+                  x_scales_gmem.at[
                       lax.div((ki * block_k), tile_k),
                       slice_m,
-                  ),
+                  ],
                   layout=_TCGEN05_COL,
                   optimized=False,
               ).astype(acc_dtype)
 
             def load_ws_acc(ni):
               ws = plgpu.load(
-                  w_scales_gmem,
-                  (
+                  w_scales_gmem.at[
                       group_id,
                       lax.div((ki * block_k), tile_k),
                       slice_n(ni),
-                  ),
+                  ],
                   layout=_TCGEN05_ROW,
                   optimized=False,
               ).astype(acc_dtype)
@@ -644,20 +643,27 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
   profile = False
   if profile:
     num_sms = 1 + collective
+  if jax.__version_info__ >= (0, 11, 0):
+    lowering_semantics = plgpu.LoweringSemantics.Warpgroup
+  else:
+    lowering_semantics = plgpu.LoweringSemantics.Lane
+
   f = plgpu.kernel(
       kernel_entry,
-      out_shape=jax.ShapeDtypeStruct((m, n), jnp.bfloat16),
+      out_type=jax.ShapeDtypeStruct((m, n), jnp.bfloat16),
       num_threads=_DEQ_WG + 2,
       thread_name="wg",
       grid=(num_sms // (1 + collective),),
       grid_names=("sm",),
       cluster=(1 + collective,),
       cluster_names=("x",),
+      kernel_name="ragged_dot_i8_quant_sm100",
       compiler_params=plgpu.CompilerParams(
           approx_math=True,
           unsafe_no_auto_barriers=True,
           profile_space=160 if profile else 0,
           profile_dir="sponge" if profile else "",
+          lowering_semantics=lowering_semantics,
       ),
   )
   return f(
@@ -665,7 +671,6 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
       x_scales,
       w,
       w_scales,
-      group_info.block,
       group_info.group_id,
       group_info.start_within_block,
       group_info.actual_size,

@@ -1,0 +1,5 @@
+rules:
+  unpinned-images:
+    ignore:
+      - ci-nightly.yml
+      - ci-build.yml

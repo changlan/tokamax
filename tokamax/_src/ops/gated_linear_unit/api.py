@@ -15,9 +15,8 @@
 """Gated linear unit API."""
 
 from collections.abc import Callable, Sequence
-from typing import Any, Final, Literal, TypeAlias
+from typing import Any, Final, Literal
 
-from absl import logging
 import immutabledict
 import jax
 from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
@@ -25,24 +24,31 @@ from tokamax._src import gpu_utils
 from tokamax._src.ops.gated_linear_unit import base
 from tokamax._src.ops.gated_linear_unit.base import FusedWeights, UnfusedWeights  # pylint: disable=g-importing-member,g-multiple-import
 
-# TODO: Add Pallas-Mosaic-GPU implementation.
-Implementation: TypeAlias = Literal['triton', 'xla']
+type Implementation = Literal['mosaic', 'triton', 'xla']
 
-IMPLEMENTATIONS = dict(xla=base.GatedLinearUnit())
-_DEFAULT_IMPLEMENTATION = ('xla',)
+_IMPLEMENTATIONS = dict(xla=base.GatedLinearUnit())
+_DEFAULT_IMPLEMENTATIONS = ('xla',)
 
 try:
-  from tokamax._src.ops.gated_linear_unit import pallas_triton  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu as pallas_mgpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
-  IMPLEMENTATIONS['triton'] = pallas_triton.PallasTritonGatedLinearUnit()
-  _DEFAULT_IMPLEMENTATION = ('triton',) + _DEFAULT_IMPLEMENTATION
+  _IMPLEMENTATIONS['mosaic'] = pallas_mgpu.PallasMosaicGpuGatedLinearUnit()
+  _DEFAULT_IMPLEMENTATIONS = ('mosaic',) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
 
+try:
+  from tokamax._src.ops.gated_linear_unit import pallas_triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+
+  _IMPLEMENTATIONS['triton'] = pallas_triton.PallasTritonGatedLinearUnit()
+  _DEFAULT_IMPLEMENTATIONS = ('triton',) + _DEFAULT_IMPLEMENTATIONS
+except ImportError:
+  pass
 
 IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
-    immutabledict.immutabledict(IMPLEMENTATIONS)
+    immutabledict.immutabledict(_IMPLEMENTATIONS)
 )
+del _IMPLEMENTATIONS
 
 
 def gated_linear_unit(
@@ -87,9 +93,8 @@ def gated_linear_unit(
   """
 
   if implementation is None:
-    implementation = _DEFAULT_IMPLEMENTATION
-
-  if not isinstance(implementation, (tuple, list)):
+    implementation = _DEFAULT_IMPLEMENTATIONS
+  elif isinstance(implementation, str):
     implementation = (implementation,)
   elif not implementation:
     raise ValueError('`implementation` must not be an empty sequence.')
@@ -107,7 +112,6 @@ def gated_linear_unit(
     try:
       return fn(x, weights, activation=activation, precision=precision)
     except NotImplementedError as e:
-      logging.error('Failed to run implementation: %s', e)
       errors.append(e)
 
   raise ExceptionGroup('all implementations failed', errors)

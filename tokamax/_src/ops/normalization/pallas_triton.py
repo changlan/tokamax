@@ -16,7 +16,7 @@
 
 import dataclasses
 import functools
-from typing import ClassVar, TypeAlias
+from typing import ClassVar, override
 
 import jax
 from jax.experimental import pallas as pl
@@ -29,11 +29,10 @@ from tokamax._src.ops.normalization import base
 from tokamax._src.ops.normalization import pallas_triton_config
 from tokamax._src.ops.normalization import pallas_triton_vjp
 from tokamax._src.pallas import block
-from typing_extensions import override
 
 
-Config: TypeAlias = pallas_triton_config.Config
-Key: TypeAlias = pallas_triton_config.Key
+Config = pallas_triton_config.Config
+Key = pallas_triton_config.Key
 FusedInputArray = base.FusedInputArray
 _NUM_REGISTERS_PER_SM = gpu_utils.NUM_REGISTERS_PER_SM
 
@@ -148,7 +147,7 @@ class PallasTritonNormalization(base.Normalization[Config, Key]):
     x_fn, x_values, x_prefetch = fuser.get_fusion_values(x)
     if x_prefetch:
       raise NotImplementedError('Prefetch not supported.')
-    x_fn_spec_puller = fuser.pull_block_spec(x_fn, x_spec, grid=grid)
+    x_fn_spec_puller = fuser.pull_block_spec(x_fn, x_spec, grid_len=len(grid))
     x_fn, (x_value_specs,), _ = x_fn_spec_puller(x_values)
 
     kernel = functools.partial(

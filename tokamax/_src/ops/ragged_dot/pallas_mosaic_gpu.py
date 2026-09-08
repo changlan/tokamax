@@ -16,10 +16,9 @@
 
 import dataclasses
 from functools import partial  # pylint: disable=g-importing-member
-from typing import ClassVar
+from typing import Any, cast, ClassVar, override
 
 import jax
-from jax.extend import backend
 import jax.numpy as jnp
 from tokamax._src import gpu_utils
 from tokamax._src import precision as precision_lib
@@ -32,16 +31,53 @@ import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_fp8_quant as s
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_i8_quant as sm100_i8_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant as sm100_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_post_scale as sm100_quant_post_scale
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm80 as sm80
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90 as sm90
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant as sm90_quant
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant_ws as sm90_quant_ws
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant_ws_async_store as sm90_quant_ws_async_store
-from typing_extensions import override
+
 
 Config = common.Config
 QArray = base.QArray
 AsQArray = base.AsQArray
 GroupSizes = base.GroupSizes
+
+# Read quant metadata from a QArray, a lazy AsQArray, or a model-side
+# PreQuantizedInputFusionGPU uniformly. Heuristics run on abstract values, so an
+# AsQArray cannot be materialized to a QArray here.
+def _is_quantized_input(x) -> bool:
+  return (
+      isinstance(x, (QArray, AsQArray))
+      or x.__class__.__name__ == "PreQuantizedInputFusionGPU"
+  )
+
+
+def _input_qtype(x):
+  if isinstance(x, (QArray, AsQArray)):
+    return x.qtype
+  if x.__class__.__name__ == "PreQuantizedInputFusionGPU":
+    return x.buffer.dtype
+  if isinstance(x, jax.Array):
+    return x.dtype
+  return None
+
+
+def _input_quant_bits(x) -> int:
+  assert (qtype := _input_qtype(x)) is not None
+  try:
+    return jnp.iinfo(qtype).bits
+  except ValueError:
+    return jnp.finfo(qtype).bits
+
+
+def _input_subchannel(x) -> int | None:
+  if isinstance(x, AsQArray):
+    x_flat, x_tree = jax.tree.flatten(x)
+    x = jax.eval_shape(lambda xs: x_tree.unflatten(xs).as_qarray(), x_flat)
+  if isinstance(x, QArray):
+    return x.scale_tile_shape[1]  # contraction-axis (index 1) tile
+  if x.__class__.__name__ == "PreQuantizedInputFusionGPU":
+    return x.subchannel_size
+  return None
 
 
 # TODO: Natively support mk,ekn->mn.
@@ -54,6 +90,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
 
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
+  enable_fused_epilogue_quant: bool = False
 
   def __post_init__(self):
     if self.vjp is None:
@@ -75,16 +112,44 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
       return_residuals: bool,
       config: Config,
       activation: base.ActivationFunction | None = None,
+      manual_axis_type: jax.sharding.ManualAxisType | None = None,
+      group_offset: jax.Array | None = None,
+      rhs_scale: jax.Array | None = None,
+      rhs_bias: jax.Array | None = None,
+      maybe_quantize_lhs: bool = False,
+      lhs_scale: jax.Array | None = None,
+      zero_initialize: bool = True,
+      fuse_gateup_activation: str | None = None,
+      lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
+      rhs_quantization_dtype: jax.typing.DTypeLike | None = None,
   ) -> tuple[jax.Array, base.Residuals]:
     # TODO: Support returning residuals from mosaic GPU kernel.
 
-    if ragged_dot_dimension_numbers == base.TRANS_RHS_RAGGED_DOT_DIM_NUMS:
-      rhs = rhs.mT  # TODO: Fuse transpose into kernel.
-      ragged_dot_dimension_numbers = base.DEFAULT_RAGGED_DOT_DIM_NUMS
+    if (
+        group_offset is not None
+        or rhs_scale is not None
+        or rhs_bias is not None
+        or maybe_quantize_lhs
+        or lhs_scale is not None
+        or not zero_initialize
+        or fuse_gateup_activation is not None
+        or lhs_quantization_dtype is not None
+        or rhs_quantization_dtype is not None
+    ):
+      raise NotImplementedError(
+          "The Pallas-Mosaic-GPU implementation does not support group_offset,"
+          " rhs_scale, rhs_bias, maybe_quantize_lhs, lhs_scale, zero_initialize,"
+          " fuse_gateup_activation, lhs_quantization_dtype,"
+          " or rhs_quantization_dtype."
+      )
 
     # None of the kernels support zero point yet.
     lhs = quantization.as_array_or_qarray_without_zero_point(lhs)
     rhs = quantization.as_array_or_qarray_without_zero_point(rhs)
+
+    if ragged_dot_dimension_numbers == base.TRANS_RHS_RAGGED_DOT_DIM_NUMS:
+      rhs = rhs.mT  # TODO: Fuse transpose into kernel.
+      ragged_dot_dimension_numbers = base.DEFAULT_RAGGED_DOT_DIM_NUMS
 
     fn = None
 
@@ -98,12 +163,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
           if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
             raise NotImplementedError(f"{precision=} not supported.")
 
-          if config.async_store:
-            fn = sm90_quant_ws_async_store.ragged_dot_quantized_ws_async_store_kernel  # pylint: disable=line-too-long
-          elif config.warp_specialized:
-            fn = sm90_quant_ws.ragged_dot_quantized_ws_kernel
-          else:
-            fn = sm90_quant.ragged_dot_quantized_kernel
+          fn = sm90_quant.ragged_dot_quantized_kernel
         else:
           if precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32:
             lhs = lhs.astype(jnp.bfloat16)
@@ -138,6 +198,13 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             fn = sm100_i8_quant.ragged_dot_gpu_i8_quant_blackwell_kernel
           elif lhs.qtype == jnp.float8_e4m3fn:
             fn = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel
+            # make sure output is bfloat16 since we may want to store lhs.scale
+            # as float32 to avoid in-kernel conversion.
+            if (
+                preferred_element_type is None
+                or preferred_element_type == jnp.float8_e4m3fn
+            ):
+              preferred_element_type = rhs.dtype
           else:
             # dequantize lhs to fallback to non-lhs-quantized kernel
             lhs = quantization.as_array(lhs)
@@ -148,6 +215,23 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             fn = sm100_quant.ragged_dot_gpu_quant_blackwell_kernel
       else:
         fn = sm100.ragged_dot_gpu_non_quant_blackwell_kernel
+    elif gpu_utils.is_sm80():
+      lhs = quantization.as_array(lhs)
+      rhs = quantization.as_array(rhs)
+
+      if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
+        if precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32:
+          lhs = lhs.astype(jnp.bfloat16)
+          rhs = rhs.astype(jnp.bfloat16)
+        else:
+          raise NotImplementedError(f"{precision=} not supported.")
+
+      if ragged_dot_dimension_numbers == base.DEFAULT_RAGGED_DOT_DIM_NUMS:
+        fn = sm80.ragged_dot_kernel
+      else:
+        raise NotImplementedError(
+            "Only default `ragged_dot_dimension_numbers` supported on SM80."
+        )
     else:
       raise NotImplementedError("Unsupported GPU architecture.")
 
@@ -164,26 +248,64 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
       )
 
     dot_out = fn(
-        lhs,
-        rhs,
+        lhs,  # pyrefly: ignore[bad-argument-type]
+        rhs,  # pyrefly: ignore[bad-argument-type]
         group_sizes,
         preferred_element_type,
         config,
         activation=activation if not return_residuals else None,
     )
+    dot_out = cast(jax.Array, dot_out)  # FIXME
     residuals = dot_out
     if activation is not None and return_residuals:
       dot_out = activation(dot_out)
 
     return dot_out, residuals if return_residuals else None
 
+  # Because fp8 ragged dot kernel has special optimization to:
+  # 1. offload subchannel rowsum (used in debiasing) to preceding quant kernel;
+  # 2. pack rowsum to scale (to not break tokamax + qwix API);
+  # 3. pre-convert scale to f32 (since fp8 ragged dot is generally ALU bound).
+  # it will break autotuning cache lookup key because the special quant kernel
+  # is not exposed to Tokamax, which solely rely on qwix to perform quantization
+  # and dequantization. For example, autotuning will set the lookup key with
+  # "scale:bf16(4096,8)" but when fp8 ragged dot kernel is used with special
+  # quant kernel, the lookup key expects to be "scale:f32(4096,16)". This hack
+  # fixes the cache lookup.
+  @override
+  def _get_autotuning_cache_key(self, ba: op.BoundArguments) -> Any:
+    lhs = ba.arguments.get("lhs")
+    if isinstance(lhs, QArray) and lhs.qtype == jnp.float8_e4m3fn:
+      if lhs.scale.dtype == jnp.bfloat16:
+        new_scale = jax.ShapeDtypeStruct(
+            lhs.scale.shape[:-1] + (lhs.scale.shape[-1] * 2,), jnp.float32
+        )
+        new_lhs = QArray(
+            qvalue=lhs.qvalue,
+            scale=new_scale,  # pyrefly: ignore[bad-argument-type]
+            zero_point=lhs.zero_point,
+            qtype=lhs.qtype,
+        )
+        new_arguments = dict(ba.arguments)
+        new_arguments["lhs"] = new_lhs
+        ba = dataclasses.replace(ba, arguments=new_arguments)
+    return base.RaggedDot._get_autotuning_cache_key(self, ba)  # pylint: disable=protected-access
+
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     lhs, rhs = ba.args
+    _is_fp8 = lambda x: _input_qtype(x) == jnp.float8_e4m3fn
+    _is_int8 = lambda x: _input_qtype(x) == jnp.int8
+
     # avoid OOMs by having too large block_k
-    block_k = (
-        min(rhs.scale_tile_shape[1], 256) if isinstance(rhs, QArray) else 128
-    )
+    rhs_subchannel = _input_subchannel(rhs)
+    block_k = min(rhs_subchannel, 256) if rhs_subchannel is not None else 128
+    if gpu_utils.is_sm100():
+      # Clamp to the activation subchannel so a finer lhs (e.g. fp8 output of a
+      # previous dot) keeps `tile_xk % block_k == 0`.
+      lhs_subchannel = _input_subchannel(lhs)
+      if lhs_subchannel is not None:
+        block_k = min(block_k, lhs_subchannel)
 
     if gpu_utils.is_sm90():
       return Config(
@@ -192,41 +314,43 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
           block_k=block_k,
           num_stages=2,
           split_k=1,
-          grid_block_n=1,
-          warp_specialized=True,
-          persistent=False,
-          async_store=True,
+          persistent=_is_quantized_input(rhs),
           grid_minor_dim=common.MatmulDimension.M,
           grid_tile_width=1,
       )
     elif gpu_utils.is_sm100():
-      if isinstance(rhs, QArray):
-        if isinstance(lhs, QArray):
-          if lhs.qtype == jnp.int8:
-            return Config(
-                block_m=16,
-                block_n=128,
-                block_k=block_k,
-                num_stages=2,
-                split_k=1,
-                grid_block_n=1,
-            )
-          elif lhs.qtype == jnp.float8_e4m3fn:
-            return Config(
-                block_m=16,
-                block_n=128,
-                block_k=block_k,
-                num_stages=2,
-                split_k=1,
-                grid_block_n=1,
-            )
+      if _is_quantized_input(rhs):
+        if _is_int8(lhs):
+          return Config(
+              block_m=16,
+              block_n=128,
+              block_k=block_k,
+              num_stages=2,
+              split_k=1,
+          )
+        elif _is_fp8(lhs):
+          preferred_element_type = ba.arguments.get("preferred_element_type")
+          epilogue_quant_qtype = None
+          epilogue_quant_subchannel_size = None
+          if self.enable_fused_epilogue_quant and preferred_element_type == jnp.float8_e4m3fn:
+            epilogue_quant_qtype = jnp.float8_e4m3fn
+            epilogue_quant_subchannel_size = 128
+          return Config(
+              block_m=16,
+              block_n=128,
+              block_k=block_k,
+              collective=False,
+              num_stages=2,
+              split_k=1,
+              epilogue_quant_qtype=epilogue_quant_qtype,
+              epilogue_quant_subchannel_size=epilogue_quant_subchannel_size,
+          )
         return Config(
             block_m=64,
             block_n=128,
             block_k=block_k,
             num_stages=2,
             split_k=1,
-            grid_block_n=1,
         )
       else:
         return Config(
@@ -235,30 +359,31 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             block_k=256,
             num_stages=2,
             split_k=1,
-            grid_block_n=1,
-            warp_specialized=True,
             persistent=False,
             collective=True,
             grid_minor_dim=common.MatmulDimension.M,
             grid_tile_width=4,
         )
+    elif gpu_utils.is_sm80():
+      return sm80.get_heuristics_config(ba)
     else:
       raise NotImplementedError("Unsupported GPU architecture.")
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    device = backend.get_default_device()
-    if float(getattr(device, "compute_capability", "9.0")) >= 10.0:
+    if gpu_utils.is_sm100():
       return self._get_sm100_autotuning_configs(ba)
+    if gpu_utils.is_sm80():
+      return sm80.get_autotuning_configs(ba)
     return self._get_sm90_autotuning_configs(ba)
 
   def _get_sm90_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     # Adjusted block_k for float16/bfloat16
     lhs, rhs = ba.args[:2]
     lhs_dtype_bits = jnp.finfo(lhs.dtype).bits
-    if isinstance(rhs, QArray):
-      rhs_dtype_bits = jnp.iinfo(rhs.qvalue.dtype).bits
-      scale_tile_shape = rhs.scale_tile_shape[1]
+    if _is_quantized_input(rhs):
+      rhs_dtype_bits = _input_quant_bits(rhs)
+      scale_tile_shape = _input_subchannel(rhs) or 0
     else:
       rhs_dtype_bits = jnp.finfo(rhs.dtype).bits
       scale_tile_shape = 0
@@ -268,98 +393,147 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     out_dtype_bits = jnp.finfo(out_dtype).bits
     out_swizzle_elems = (128 * 8) // out_dtype_bits
 
-    warp_specialized = [True, False] if isinstance(rhs, QArray) else [True]
-
     configs = set()
     for persistent in [True, False]:
-      for ws in warp_specialized:
-        for async_store in [True, False]:
-          for block_k in [128, 256, 512]:
-            if (block_k * rhs_dtype_bits) % (128 * 8) or (
-                block_k * lhs_dtype_bits
-            ) % (128 * 8):
-              continue
-            if scale_tile_shape != 0 and scale_tile_shape % block_k != 0:
-              continue
-            for block_m in [128, 64, 32, 16]:
-              for num_stages in [4, 2]:
-                for grid_minor_dim in [
-                    common.MatmulDimension.M,
-                    common.MatmulDimension.N,
-                ]:
-                  for grid_tile_width in [1, 2, 4, 8]:
-                    configs.add(
-                        Config(
-                            block_m=block_m,
-                            block_n=out_swizzle_elems,
-                            block_k=block_k,
-                            num_stages=num_stages,
-                            warp_specialized=ws,
-                            persistent=persistent,
-                            split_k=1,
-                            async_store=async_store,
-                            grid_block_n=grid_tile_width,
-                            grid_minor_dim=grid_minor_dim,
-                            grid_tile_width=grid_tile_width,
-                        )
+      for block_k in [128, 256, 512]:
+        if (block_k * rhs_dtype_bits) % (128 * 8) or (
+            block_k * lhs_dtype_bits
+        ) % (128 * 8):
+          continue
+        if scale_tile_shape != 0 and scale_tile_shape % block_k != 0:
+          continue
+        for block_m in [128, 64, 32, 16]:
+          for num_stages in [4, 2]:
+            for grid_minor_dim in [
+                common.MatmulDimension.M,
+                common.MatmulDimension.N,
+            ]:
+              for grid_tile_width in [1, 2, 4, 8]:
+                configs.add(
+                    Config(
+                        block_m=block_m,
+                        block_n=out_swizzle_elems,
+                        block_k=block_k,
+                        num_stages=num_stages,
+                        persistent=persistent,
+                        split_k=1,
+                        grid_minor_dim=grid_minor_dim,
+                        grid_tile_width=grid_tile_width,
                     )
+                )
     return configs
 
   def _get_sm100_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    del ba  # Unused.
-    configs = set()
-    # Configs for prefill
-    for block_k in [128, 256]:
-      for num_stages in [2, 4]:
-        for grid_minor_dim in [
-            common.MatmulDimension.M,
-            common.MatmulDimension.N,
-        ]:
-          for grid_tile_width in [1, 2, 4, 8]:
-            for split_m in [1, 2]:
-              configs.add(
-                  Config(
-                      block_m=128,
-                      block_n=128,
-                      block_k=block_k,
-                      num_stages=num_stages,
-                      split_k=1,
-                      grid_block_n=1,
-                      warp_specialized=True,
-                      persistent=False,
-                      collective=True,
-                      grid_minor_dim=grid_minor_dim,
-                      grid_tile_width=grid_tile_width,
-                      split_m=split_m,
-                  )
-              )
+    lhs, rhs = ba.args[:2]
+    lhs_dtype_bits = jnp.finfo(lhs.dtype).bits
+    if _is_quantized_input(rhs):
+      rhs_dtype_bits = _input_quant_bits(rhs)
+      scale_tile_shape = _input_subchannel(rhs) or 0
+    else:
+      rhs_dtype_bits = jnp.finfo(rhs.dtype).bits
+      scale_tile_shape = 0
 
-    # Config for generate
-    for block_m in [8, 16, 32, 64]:
-      for num_stages in [2, 4]:
-        for grid_minor_dim in [
-            common.MatmulDimension.M,
-            common.MatmulDimension.N,
-        ]:
-          for grid_tile_width in [1, 2, 4, 8]:
-            for split_m in [1, 2]:
-              for collective in [True, False]:
-                for post_scale in [True, False]:
-                  configs.add(
-                      Config(
-                          block_m=block_m,
-                          block_n=128,
-                          block_k=256,
-                          num_stages=num_stages,
-                          split_k=1,
-                          warp_specialized=True,
-                          collective=collective,
-                          split_m=split_m,
-                          grid_tile_width=grid_tile_width,
-                          grid_minor_dim=grid_minor_dim,
-                          post_scale=post_scale,
+    block_k_choices = []
+    for block_k in [128, 256, 512]:
+      if (block_k * rhs_dtype_bits) % (128 * 8) or (
+          block_k * lhs_dtype_bits
+      ) % (128 * 8):
+        continue
+      if scale_tile_shape != 0 and scale_tile_shape % block_k != 0:
+        continue
+      block_k_choices.append(block_k)
+    grid_minor_dim_choices = [
+        common.MatmulDimension.M,
+        common.MatmulDimension.N,
+    ]
+    grid_tile_width_choices = [1, 2, 4, 8]
+
+    configs = set()
+
+    def _generate_configs(
+        configs,
+        block_m_choices: list[int],
+        block_k_choices: list[int],
+        num_stages_choices: list[int],
+        grid_minor_dim_choices: list[common.MatmulDimension],
+        grid_tile_width_choices: list[int],
+        split_m_choices: list[int],
+        collective_choices: list[bool],
+        post_scale_choices: list[bool],
+    ):
+      epilogue_quant_qtype = None
+      epilogue_quant_subchannel_size = None
+
+      preferred_element_type = ba.arguments.get("preferred_element_type")
+      if self.enable_fused_epilogue_quant and preferred_element_type == jnp.float8_e4m3fn:
+        epilogue_quant_qtype = jnp.float8_e4m3fn
+        epilogue_quant_subchannel_size = 128
+
+      for block_m in block_m_choices:
+        for block_k in block_k_choices:
+          for num_stages in num_stages_choices:
+            for grid_minor_dim in grid_minor_dim_choices:
+              for grid_tile_width in grid_tile_width_choices:
+                for split_m in split_m_choices:
+                  for collective in collective_choices:
+                    for post_scale in post_scale_choices:
+                      configs.add(
+                          Config(
+                              block_m=block_m,
+                              block_n=128,
+                              block_k=block_k,
+                              num_stages=num_stages,
+                              split_k=1,
+                              persistent=False,
+                              collective=collective,
+                              post_scale=post_scale,
+                              grid_minor_dim=grid_minor_dim,
+                              grid_tile_width=grid_tile_width,
+                              split_m=split_m,
+                              epilogue_quant_qtype=epilogue_quant_qtype,
+                              epilogue_quant_subchannel_size=epilogue_quant_subchannel_size,
+                          )
                       )
-                  )
+      return configs
+
+    if _is_quantized_input(lhs):
+      if _input_qtype(lhs) in [jnp.int8, jnp.float8_e4m3fn]:
+        configs = _generate_configs(
+            configs,
+            block_m_choices=[8, 16, 32],
+            block_k_choices=[128, 256, 512],
+            num_stages_choices=[2],
+            grid_minor_dim_choices=grid_minor_dim_choices,
+            grid_tile_width_choices=grid_tile_width_choices,
+            split_m_choices=[1],
+            collective_choices=[False, True],
+            post_scale_choices=[False],
+        )
+    else:
+      # Configs for prefill
+      configs = _generate_configs(
+          configs,
+          block_m_choices=[128],
+          block_k_choices=block_k_choices,
+          num_stages_choices=[2, 4],
+          grid_minor_dim_choices=grid_minor_dim_choices,
+          grid_tile_width_choices=grid_tile_width_choices,
+          split_m_choices=[1],
+          collective_choices=[True, False],
+          post_scale_choices=[False],
+      )
+      # Config for generate
+      configs = _generate_configs(
+          configs,
+          block_m_choices=[8, 16, 32, 64],
+          block_k_choices=block_k_choices,
+          num_stages_choices=[2, 4],
+          grid_minor_dim_choices=grid_minor_dim_choices,
+          grid_tile_width_choices=grid_tile_width_choices,
+          split_m_choices=[1],
+          collective_choices=[True, False],
+          post_scale_choices=[True, False],
+      )
     return configs
 
   @override

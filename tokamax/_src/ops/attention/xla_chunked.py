@@ -20,16 +20,16 @@ gives more similar numerics to FlashAttention.
 
 import dataclasses
 import functools
+from typing import override
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
+from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
-from typing_extensions import override
-
 
 Mask = base.Mask
 QArray = base.QArray
@@ -151,7 +151,7 @@ def _attend_chunked(
 
   q_len_or_indices = seq_q if q_indices is None else q_indices
   k_len_or_indices = seq_k if k_indices is None else k_indices
-  mask = mask.as_array(q_len_or_indices, k_len_or_indices)
+  mask_ = mask.as_array(q_len_or_indices, k_len_or_indices)
 
   def get_chunk(x, idx, size, axis):
     if x is None:
@@ -166,7 +166,7 @@ def _attend_chunked(
 
     q_chunk = get_q_chunk(q, -3)
     bias_chunk = get_q_chunk(bias, -2)
-    mask_chunk = get_q_chunk(mask, -2)
+    mask_chunk = get_q_chunk(mask_, -2)
     dropout_mask_chunk = get_q_chunk(dropout_mask, -2)
 
     intermediates_shape = (*b, h, q_chunk.shape[-3])
@@ -215,20 +215,22 @@ def _attend_chunked(
     out = acc / denom.mT[..., None] if normalize_output else acc
     return q_chunk_idx + q_chunk_size, out.astype(q.dtype)
 
-  q_chunk_idx, out = 0, None
-
   # Main q loop
   if seq_q >= q_chunk_size:
     loop_fn = functools.partial(q_loop_fn, q_chunk_size=q_chunk_size)
     length = seq_q // q_chunk_size
     q_chunk_idx, out = jax.lax.scan(loop_fn, init=0, length=length)
     out = shape_lib.einshape("q...thd->...(qt)hd")(out)
+  else:
+    q_chunk_idx = 0
+    out = None
 
   # Remainder q loop
   if (q_remainder := (seq_q % q_chunk_size)) != 0:
     _, rem_out = q_loop_fn(q_chunk_idx, None, q_chunk_size=q_remainder)
     out = rem_out if out is None else jnp.concatenate([out, rem_out], axis=-3)
 
+  assert out is not None
   return out, None
 
 
@@ -325,7 +327,7 @@ class XlaChunkedDotProductAttention(
       k: Float[Array | QArray, "*b t h D"],
       v: Float[Array | QArray, "*b t h d"],
       *,
-      precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+      precision: tuple[base.CanonicalPrecision, base.CanonicalPrecision],
       logits_dtype: jnp.dtype,
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
@@ -356,17 +358,25 @@ class XlaChunkedDotProductAttention(
     if is_paged and not single_chunk:
       raise ValueError("Paged attention does not support multiple chunk sizes.")
 
-    if not is_paged and single_chunk:
-      chunk_size = (self.chunk_size,) * 2
-    else:
-      chunk_size = self.chunk_size
+    q_k_dot_precision, weights_v_dot_precision = precision
+    q_k_dot_precision = precision_lib.to_dot_algorithm_preset(
+        q.dtype, k.dtype, q_k_dot_precision
+    )
+    weights_v_dot_precision = precision_lib.to_dot_algorithm_preset(
+        v.dtype, v.dtype, weights_v_dot_precision
+    )
 
-    attn_fn = _attend_paged if is_paged else _attend_chunked
+    if is_paged:
+      attn_fn = functools.partial(_attend_paged, chunk_size=self.chunk_size)
+    else:
+      chunk_size = (n, n) if isinstance(n := self.chunk_size, int) else n
+      attn_fn = functools.partial(_attend_chunked, chunk_size=chunk_size)
+
     return attn_fn(
         q,
         k,
         v,
-        precision=precision,
+        precision=(q_k_dot_precision, weights_v_dot_precision),
         logits_dtype=logits_dtype,
         logits_scale=logits_scale,
         bias=bias,
@@ -378,5 +388,4 @@ class XlaChunkedDotProductAttention(
         q_indices=q_indices,
         k_indices=k_indices,
         normalize_output=normalize_output,
-        chunk_size=chunk_size,
     )

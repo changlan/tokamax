@@ -20,7 +20,6 @@ import chex
 import jax
 from jax.experimental import mesh_utils
 import jax.numpy as jnp
-
 from tokamax._src import gpu_utils
 from tokamax._src.ops.attention import api
 
@@ -31,24 +30,34 @@ PartitionSpec = jax.sharding.PartitionSpec
 
 class ApiShardingTest(parameterized.TestCase):
 
-  @parameterized.parameters(*api.IMPLEMENTATIONS)
-  def test_dot_product_attention_sharding(self, implementation):
-    if implementation == 'mosaic' and not gpu_utils.has_mosaic_gpu_support():
+  @parameterized.product(
+      implementation=list(api.IMPLEMENTATIONS),
+      shard_axis=[0, 2],
+  )
+  def test_dot_product_attention_sharding(self, implementation, shard_axis):
+    if (
+        implementation == 'mosaic_gpu'
+        and not gpu_utils.has_mosaic_gpu_support()
+    ):
       self.skipTest('Mosaic not supported on this platform.')
     if implementation == 'triton' and not gpu_utils.has_triton_support():
       self.skipTest('Triton not supported on this platform.')
     if implementation == 'cudnn' and jax.default_backend() != 'gpu':
       self.skipTest('cuDNN only supported on GPU')
+    if implementation == 'mosaic_tpu' and jax.default_backend() != 'tpu':
+      self.skipTest('Mosaic TPU only supported on TPU')
 
     if jax.device_count() < 2:
       self.skipTest('Requires at least 2 devices for sharding.')
 
     devices = mesh_utils.create_device_mesh((jax.device_count(),))
     mesh = Mesh(devices, axis_names='x')
-    sharding = NamedSharding(mesh, PartitionSpec('x'))
+    spec: list[str | None] = [None, None, None, None]
+    spec[shard_axis] = 'x'
+    sharding = NamedSharding(mesh, PartitionSpec(*spec))
 
     dtype = jnp.bfloat16
-    b, s, t, n, h = jax.device_count(), 128, 128, 4, 64
+    b, s, t, n, h = jax.device_count(), 512, 512, jax.device_count() * 2, 64
     keys = jax.random.split(jax.random.PRNGKey(0), 3)
     q = jax.random.normal(keys[0], (b, t, n, h), dtype)
     k = jax.random.normal(keys[1], (b, s, n, h), dtype)

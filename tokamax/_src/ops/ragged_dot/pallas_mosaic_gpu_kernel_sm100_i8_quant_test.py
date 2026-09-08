@@ -14,6 +14,7 @@
 # ==============================================================================
 
 import dataclasses
+from typing import override
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
@@ -25,7 +26,7 @@ from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu
 from tokamax._src.ops.ragged_dot import test_base
-from typing_extensions import override
+
 
 # Config for enabling use_native_int8_mma for testing quant_i8 kernel.
 _CONFIG = pallas_mosaic_gpu.Config(
@@ -34,7 +35,6 @@ _CONFIG = pallas_mosaic_gpu.Config(
     block_k=512,
     num_stages=2,
     split_k=1,
-    grid_block_n=1,
     persistent=True,
     collective=False,
     grid_minor_dim=pallas_mosaic_gpu.common.MatmulDimension.M,

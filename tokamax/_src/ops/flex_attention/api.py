@@ -21,10 +21,3 @@ from tokamax._src.ops.flex_attention import base
 IMPLEMENTATIONS: Final[dict[str, base.FlexAttention]] = dict(
     xla=base.FlexAttention(),
 )
-
-try:
-  from tokamax._src.ops.flex_attention import pallas_triton  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
-
-  IMPLEMENTATIONS['triton'] = pallas_triton.PallasTritonGatedLinearUnit()
-except ImportError:
-  pass

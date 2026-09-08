@@ -16,16 +16,18 @@
 
 import abc
 import collections
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Hashable, Mapping
+import contextlib
+import contextvars
 import dataclasses
 import functools
 import inspect
-import threading
-from typing import Any, ClassVar, Concatenate, Final, Generic, Literal, ParamSpec, Self, TypeVar, cast, overload
+from typing import Any, ClassVar, Concatenate, Final, Literal, Self, cast, final, overload
 
 from absl import logging
 import immutabledict
 import jax
+from jax.experimental import xla_metadata
 from jax.extend import backend
 import jax.numpy as jnp
 import numpy as np
@@ -40,12 +42,6 @@ from tokamax._src import utils
 from tokamax._src.autotuning import autotuner as autotuner_lib
 from tokamax._src.autotuning import cache as autotuning_cache
 
-
-_P = ParamSpec("_P")
-_T = TypeVar("_T")
-_R = TypeVar("_R")
-_Config = TypeVar("_Config")
-_Key = TypeVar("_Key")
 AutotuningData = autotuner_lib.AutotuningData
 DeviceKind = autotuning_cache.DeviceKind
 
@@ -67,13 +63,13 @@ class _FlatTree:
 
 @jax.tree_util.register_pytree_node_class
 @dataclasses.dataclass(frozen=True, slots=True)
-class Residuals(Generic[_T, _R]):
+class Residuals[T, R]:
   """Complete arguments and residual values passed to VJP."""
 
   args: tuple[Any, ...]
   kwargs: dict[str, Any]
-  out: _T
-  residuals: _R
+  out: T
+  residuals: R
 
   def tree_flatten(self) -> tuple[Any, Any]:  # pylint: disable=missing-function-docstring
     args_flat, args_tree = jax.tree.flatten((self.args, self.kwargs))
@@ -101,8 +97,26 @@ class Residuals(Generic[_T, _R]):
     return cls(args, kwargs, out, residuals)
 
 
+_ACTIVE_TOKAMAX_PAYLOAD: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "tokamax_payload", default=""
+)
+
+
+@contextlib.contextmanager
+def _tokamax_metadata(json_data: str):
+  """Sets the Tokamax payload, stacking onto an enclosing one outermost-first."""
+  prev = _ACTIVE_TOKAMAX_PAYLOAD.get()
+  payload = f"{prev}/tokamax:{json_data}" if prev else f"tokamax:{json_data}"
+  reset = _ACTIVE_TOKAMAX_PAYLOAD.set(payload)
+  try:
+    with xla_metadata.set_xla_metadata(xla_metadata_payload=payload):
+      yield
+  finally:
+    _ACTIVE_TOKAMAX_PAYLOAD.reset(reset)
+
+
 @dataclasses.dataclass(frozen=True)
-class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
+class Op[**P, T, R, C, K: Hashable](abc.ABC):
   """Base class for operations.
 
   `Op`s are callable. The `__call__` method will perform the following steps:
@@ -141,20 +155,21 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
     - Optionally, set a default `vjp` function.
   """
 
-  config_cls: ClassVar[type[_Config]] = NullConfig
+  config_cls: ClassVar[type[Any]] = NullConfig  # `type[_Config]` not supported.
   # Whether an op allows abstract inputs with `jax.export.symbolic_shape`
   # instances in array shapes.
   supports_symbolic_shapes: ClassVar[bool] = True
   supports_batched_args_capture: ClassVar[bool] = True
 
-  config: _Config | None = None
+  config: C | None = None
   _: dataclasses.KW_ONLY
+  bypass_device_check: bool = False
   # VJP function for the op. `vjp` will be passed the residuals and the output
   # of the op, the output gradients, then all arguments passed to the op.
   # The VJP function must return a tuple of gradients for each positional
   # argument, or a dict `{"argname": gradient, ...}`. If a dict is returned, any
   # input array arguments not in the dict will have gradients set to zeros.
-  vjp: Callable[Concatenate[_R, _T, _T, _P], Any] | None = None
+  vjp: Callable[Concatenate[R, T, T, P], Any] | None = None
 
   def __init_subclass__(cls, *args, **kwargs):
     super().__init_subclass__(*args, **kwargs)
@@ -164,24 +179,27 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
   @overload
   def __call__(
       self,
-      *args: _P.args,
-      return_residuals: Literal[False] = ...,
-      **kwargs: _P.kwargs,
-  ) -> _T:
+      *args: P.args,
+      return_residuals: Literal[False] = ...,  # pyrefly: ignore[bad-function-definition]
+      **kwargs: P.kwargs,
+  ) -> T:
     ...
 
   @overload
   def __call__(
       self,
-      *args: _P.args,
-      return_residuals: Literal[True] = ...,
-      **kwargs: _P.kwargs,
-  ) -> tuple[_T, _R]:
+      *args: P.args,
+      return_residuals: Literal[True],  # pyrefly: ignore[bad-function-definition]
+      **kwargs: P.kwargs,
+  ) -> tuple[T, R]:
     ...
 
   def __call__(
-      self, *args: _P.args, return_residuals: bool = False, **kwargs: _P.kwargs
-  ) -> _T | tuple[_T, _R]:
+      self,
+      *args: P.args,
+      return_residuals: bool = False,  # pyrefly: ignore[bad-function-definition]
+      **kwargs: P.kwargs,
+  ) -> T | tuple[T, R]:
     """Applies the operation with the given arguments."""
 
     if not self.supports_symbolic_shapes and shape.contains_symbolic_shape(
@@ -189,12 +207,14 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
     ):
       raise NotImplementedError("This op does not support symbolic shapes.")
 
-    bind = cast(Callable[_P, Any], self.bind)  # Work around pytype bug.
+    bind = cast(Callable[P, Any], self.bind)  # Work around pytype bug.
     ba = bind(*args, **kwargs)
 
-    for device in infer_devices(ba) or {backend.get_default_device()}:
-      if not self.supported_on(device):
-        raise NotImplementedError(f"Not supported on {device.device_kind}.")
+    bypass = self.bypass_device_check or config_lib.cross_compile.value
+    if not bypass:
+      for device in infer_devices(ba) or {backend.get_default_device()}:
+        if not self.supported_on(device):
+          raise NotImplementedError(f"Not supported on {device.device_kind}.")
 
     args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs))
     is_array = lambda x: isinstance(x, (jax.Array, np.ndarray))
@@ -218,7 +238,7 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
       json_ba = BoundArguments(json_op, _abstractify(dict(ba.arguments)))
       json_data = str(BOUND_ARGS_ADAPTER.dump_json(json_ba), "utf-8")
 
-      with jax.named_scope(f"tokamax:{json_data}"):
+      with _tokamax_metadata(json_data):
         if fwd_res and self.vjp is None and batched_args is not None:
 
           def fwd_flat(*arrays):
@@ -267,7 +287,7 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
         out = residuals.out
         residuals = residuals.residuals
         dout = dout[0] if return_residuals else dout
-        grads = self.vjp(residuals, out, dout, *args, **kwargs)  # pytype: disable=wrong-arg-count
+        grads = self.vjp(residuals, out, dout, *args, **kwargs)
 
         if isinstance(grads, dict):
           grads_ba = ba.signature.bind_partial(**grads)
@@ -293,7 +313,7 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
     return f(*arrays)
 
   def bind(
-      self, *args: _P.args, return_residuals: bool = False, **kwargs: _P.kwargs
+      self, *args: P.args, return_residuals: bool = False, **kwargs: P.kwargs  # pyrefly: ignore[bad-function-definition]
   ) -> "BoundArguments":
     """Binds the op to the given arguments."""
     sig = self._fwd_signature
@@ -311,42 +331,57 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
 
   def get_autotuning_cache(
       self, device_kind: DeviceKind | None = None
-  ) -> dict[_Key, AutotuningData[_Config]]:
+  ) -> dict[K, AutotuningData[C]]:
     self_no_vjp = self.replace(vjp=None)
-    if (cache := _AUTOTUNING_CACHE.get(self_no_vjp)) is None:
-      cache = autotuning_cache.AutotuningCache(self_no_vjp)
-      _AUTOTUNING_CACHE[self_no_vjp] = cache
+    final_cache = {}
     if device_kind is None:
       device_kind = backend.get_default_device().device_kind
-    return cache[device_kind]
+    if not config_lib.ignore_autotuning_cache.value:
+      if (cache := _AUTOTUNING_CACHE.get(self_no_vjp)) is None:
+        cache = autotuning_cache.AutotuningCache(
+            self_no_vjp, paths=[autotuning_cache.CACHE_PATH]
+        )
+        _AUTOTUNING_CACHE[self_no_vjp] = cache
+
+      final_cache = cache[device_kind]
+      logging.info("Loaded autotuning cache for %s", self_no_vjp)
+    else:
+      logging.warning("Ignoring autotuning cache for %s", self_no_vjp)
+
+    return final_cache
 
   @abc.abstractmethod
-  def _fwd(self, *args, **kwargs) -> tuple[_T, _R | None]:
+  def _fwd(self, *args, **kwargs) -> tuple[T, R | None]:
     ...
 
-  def _get_heuristics_config(self, ba: "BoundArguments") -> _Config:
+  def _get_heuristics_config(self, ba: "BoundArguments") -> C:
     """Returns a config based on heuristics."""
     del ba  # Unused.
-    return _NULL_CONFIG
+    if type(self).config_cls is NullConfig:
+      return cast(C, _NULL_CONFIG)
+    raise NotImplementedError("`_get_heuristics_config` not implemented.")
 
-  def _get_autotuning_cache_key(self, ba: "BoundArguments") -> _Key:
+  def _get_autotuning_cache_key(self, ba: "BoundArguments") -> K:
     """Returns a key for autotuning cache lookup."""
     pos_arg_names = tuple(
         name
         for name, param in ba.signature.parameters.items()
         if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD)
     )
-    return immutabledict.immutabledict((
+    key = immutabledict.immutabledict((
         *zip(pos_arg_names, _abstractify(ba.args), strict=True),
         *_abstractify(ba.kwargs).items(),
     ))
+    return cast(K, key)
 
-  def _get_autotuning_configs(self, ba: "BoundArguments") -> set[_Config]:
+  def _get_autotuning_configs(self, ba: "BoundArguments") -> set[C]:
     """Returns configs to autotune."""
     del ba  # Unused.
     return set()
 
-  def _capture_batched_args(self, fn: Callable[..., _T]) -> Callable[..., _T]:
+  def _capture_batched_args[_T2](
+      self, fn: Callable[..., _T2]
+  ) -> Callable[..., _T2]:
     if self.supports_batched_args_capture:
       return batching.capture_batched_args(fn)
     return lambda *args, **kwargs: fn(*args, batched_args=None, **kwargs)
@@ -375,28 +410,26 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
     return True
 
 
-_AUTOTUNING_CACHE: dict[
-    Op, dict[DeviceKind, dict[Any, AutotuningData[Any]]]
-] = {}
-_AUTOTUNING_CACHE_OVERLAY = threading.local()
+type AutotuningCache = dict[DeviceKind, dict[Any, AutotuningData[Any]]]
+
+_AUTOTUNING_CACHE: dict[Op, AutotuningCache] = {}  # pylint: disable=g-bare-generic
+
+AUTOTUNING_CACHE_OVERLAY_STACK: Final[
+    contextvars.ContextVar[tuple[dict[Op, AutotuningCache], ...]]  # pylint: disable=g-bare-generic
+] = contextvars.ContextVar("AUTOTUNING_CACHE_OVERLAY_STACK", default=())
+AUTOTUNING_CACHE_OVERLAY_JAX_CONFIG: Final[Any] = jax.make_user_context(())
 
 
-def get_autotuning_cache_overlay_state() -> Any:
-  if not hasattr(_AUTOTUNING_CACHE_OVERLAY, "stack"):
-    _AUTOTUNING_CACHE_OVERLAY.stack = []
-    _AUTOTUNING_CACHE_OVERLAY.context = jax.make_user_context(())
-  return _AUTOTUNING_CACHE_OVERLAY
-
-
+@final
 class AUTO:
   ...
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class BoundArguments(Generic[_Config, _Key]):
+class BoundArguments[C, K: Hashable]:
   """Bound arguments for an op's `__call__` method."""
 
-  op: Op[..., Any, Any, _Config, _Key]  # pytype: disable=invalid-annotation
+  op: Op[..., Any, Any, C, K]
   arguments: Mapping[str, Any]
 
   def __post_init__(self):
@@ -425,7 +458,7 @@ class BoundArguments(Generic[_Config, _Key]):
     return batching.get_vmap_axis_sizes(dict(self.arguments))
 
   @property
-  def default_config(self) -> _Config:
+  def default_config(self) -> C:
     """Returns the default config for the op.
 
     The default config is determined as follows:
@@ -450,10 +483,10 @@ class BoundArguments(Generic[_Config, _Key]):
   def get_config(
       self,
       check_autotuning_cache: bool = True,
-      autotune_configs: set[_Config] | type[AUTO] | None = None,
+      autotune_configs: set[C] | type[AUTO] | None = None,
       cache_autotuning_results: bool = True,
       allow_heuristics: bool = True,
-  ) -> _Config:
+  ) -> C:
     """Returns a config.
 
     Args:
@@ -476,12 +509,12 @@ class BoundArguments(Generic[_Config, _Key]):
 
     if check_autotuning_cache:
       if (data := self.cached_autotuning_data) is not None and data.items():
-        return data.fastest_config  # pytype: disable=unbound-type-param
+        return data.fastest_config
 
     if autotune_configs is not None:
       return self.autotune(
           autotune_configs, cache_results=cache_autotuning_results
-      ).fastest_config  # pytype: disable=unbound-type-param
+      ).fastest_config
 
     if allow_heuristics:
       return heuristics_config
@@ -489,24 +522,27 @@ class BoundArguments(Generic[_Config, _Key]):
     raise ValueError(f"No config found for {self}.")
 
   @property
-  def heuristics_config(self) -> _Config:
+  def heuristics_config(self) -> C:
     """Returns a config based on heuristics."""
     return self.op._get_heuristics_config(self)  # pylint: disable=protected-access
 
   @property
-  def autotuning_cache_key(self) -> _Key:
+  def autotuning_cache_key(self) -> K:
     """Returns a key for autotuning cache lookup."""
     return self.op._get_autotuning_cache_key(self)  # pylint: disable=protected-access
 
   @property
-  def cached_autotuning_data(self) -> AutotuningData[_Config] | None:
+  def cached_autotuning_data(self) -> AutotuningData[C] | None:
     """Returns autotuning data from the cache, if available."""
+    if config_lib.ignore_autotuning_cache.value:
+      return None
+
     device_kind = infer_device_kind(self)
     if device_kind is None:
       device_kind = backend.get_default_device().device_kind
     key = self.autotuning_cache_key
 
-    for overlay in reversed(get_autotuning_cache_overlay_state().stack):
+    for overlay in reversed(AUTOTUNING_CACHE_OVERLAY_STACK.get()):
       data = overlay.get(self.op, {}).get(device_kind, {}).get(key)
       if data is not None:
         return data
@@ -514,16 +550,19 @@ class BoundArguments(Generic[_Config, _Key]):
     try:
       return self.op.get_autotuning_cache()[key]
     except KeyError:
+      key = cast(Mapping[str, Any], key)
+      json_key_bytes = _get_arg_spec_adapter(self.op).dump_json(dict(key))
+
       logging.warning(
           "Autotuning cache miss for %s on %s with key %s",
           self.op,
           device_kind,
-          key,
+          str(json_key_bytes, "utf-8"),
       )
       return None
 
   @property
-  def autotuning_configs(self) -> set[_Config]:
+  def autotuning_configs(self) -> set[C]:
     """Returns the configs used for autotuning when `AUTO` is specified."""
     return {self.heuristics_config} | self.op._get_autotuning_configs(self)  # pylint: disable=protected-access
 
@@ -545,17 +584,25 @@ class BoundArguments(Generic[_Config, _Key]):
 
   def autotune(
       self,
-      configs: set[_Config] | type[AUTO] = AUTO,
+      configs: set[C] | type[AUTO] = AUTO,
       autotuner: autotuner_lib.Autotuner = autotuner_lib.Autotuner(),
       cache_results: bool = True,
-  ) -> AutotuningData[_Config]:
+      timeout: float | None = None,
+  ) -> AutotuningData[C]:
     """Autotunes the op with the bound arguments."""
     if configs is AUTO:
       configs = self.autotuning_configs
+    configs = cast(set[C], configs)
 
     logging.debug("Autotuning %s(%s)", self.op, self.arguments)
     op_fn = lambda config: self.op.replace(config=config)
-    data = autotuner.autotune(op_fn, configs, *self.args, **self.kwargs)
+    data = autotuner.autotune(
+        op_fn,
+        configs,
+        *self.args,
+        timeout=timeout,
+        **self.kwargs,
+    )
     if cache_results:
       d = self.op.get_autotuning_cache()
       d[self.autotuning_cache_key] = data

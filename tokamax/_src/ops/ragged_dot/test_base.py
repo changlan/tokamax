@@ -67,11 +67,7 @@ def override_chex_args(**kwargs):
   assert_close = lambda *a, **kw: orig_assert_close(*a, **(kw | kwargs))
   return mock.patch.object(chex, "assert_trees_all_close", assert_close)
 
-
-NAMED_ARG_SPECS = {
-    s.full_name: s.args for s in ARG_SPECS if "primary" in s.tags
-}
-
+NAMED_ARG_SPECS = {s.full_name: s for s in ARG_SPECS if "ci_tests" in s.tags}
 
 # TODO: `jax.nn.relu` is annotated with `custom_jvp_call`
 # which isn't compatible with `_estimate_resources` in the mosaic lowering.
@@ -319,18 +315,31 @@ class RaggedDotTestBase(parameterized.TestCase):
 
   @parameterized.named_parameters(NAMED_ARG_SPECS.items())
   def test_bench(self, spec):
-    self._test_bench(spec)
+    if jax.devices()[0].device_kind in spec.excluded_platforms:
+      self.skipTest(f"Skip the test on {jax.devices()[0].device_kind}.")
+
+    if "m1179648" in self._testMethodName and jax.default_backend() == "gpu":
+      self.skipTest(f"{self._testMethodName} doesn't fit into a GPU slice")
+
+    self._test_bench(spec.args)
 
   def _test_bench(self, spec):
     kwargs = numerics.random_initialize(spec)
     # Skip the test if the reference implementation fails,
     # e.g out-of-memory.
     try:
+      if isinstance(spec["lhs"], qwix.QArray):
+        # lower precision lhs requires looser tolerances
+        atol, rtol = 1, 0.5  # This is really bad!
+        if jax.default_backend() == "tpu":
+          self.skipTest("lower precision lhs not supported on TPUs.")
+      else:
+        atol, rtol = 0.01, 0.005
       expected = ref(**kwargs)
       actual = self._dot_fn(**kwargs)
       count = sum(spec["group_sizes"].representative_value)
       chex.assert_trees_all_close(
-          actual[:count], expected[:count], atol=0.01, rtol=0.005
+          actual[:count], expected[:count], atol=atol, rtol=rtol
       )
     except Exception as e:  # pylint: disable=broad-exception-caught
       if "RESOURCE_EXHAUSTED: Out of memory while trying to allocate" in str(e):

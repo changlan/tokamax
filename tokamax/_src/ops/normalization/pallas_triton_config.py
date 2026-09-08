@@ -16,7 +16,7 @@
 
 from collections.abc import Sequence
 import math
-from typing import Any, TypeAlias
+from typing import Any
 
 import immutabledict
 import jax
@@ -34,7 +34,7 @@ class Config:
   num_warps: pydantic_lib.PowerOfTwo
 
 
-Key: TypeAlias = immutabledict.immutabledict[str, Any]
+type Key = immutabledict.immutabledict[str, Any]
 
 
 def canonicalize_shape_3d(
@@ -80,9 +80,9 @@ def get_key(
 
 
 def get_heuristics_config(
-    x: jax.Array,
-    scale: jax.Array | None,
-    offset: jax.Array | None,
+    x: jax.Array | jax.ShapeDtypeStruct,
+    scale: jax.Array | jax.ShapeDtypeStruct | None,
+    offset: jax.Array | jax.ShapeDtypeStruct | None,
     *,
     axis: int,
     block_size_per_warp: int = 1024,

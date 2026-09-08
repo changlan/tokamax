@@ -19,7 +19,7 @@
 from collections.abc import Callable
 import functools
 import json
-
+from typing import Final
 import jax
 from jax import lax
 from jax.experimental import pallas as pl
@@ -34,6 +34,9 @@ from tokamax._src.ops.ragged_dot import base
 
 CanonicalPrecision = precision_lib.CanonicalPrecision
 QArray = qwix.QArray
+
+_KERNEL_NAME_GMM: Final[str] = "pallas_tpu_ragged_dot_gmm"
+_KERNEL_NAME_TGMM: Final[str] = "pallas_tpu_ragged_dot_tgmm"
 
 
 def _validate_args(
@@ -270,7 +273,7 @@ def _quantize_as(x, qdtype: jnp.dtype, axis: int, scale: float | None):
     ).astype(jnp.bfloat16)
     inv_scales = jnp.broadcast_to(1.0 / scales, x.shape)
   else:  # compile-time (static) quantization scale
-    scales, inv_scales = scale, 1.0 / scale
+    scales, inv_scales = jnp.array(scale, jnp.bfloat16), 1.0 / scale
   return QArray(jnp.round(x * inv_scales).astype(qdtype), scales)
 
 
@@ -321,6 +324,7 @@ _TilingFn = Callable[[int, int, int], tuple[int, int, int] | None]
         "rhs_qdtype",
         "rhs_static_scale",
         "activation",
+        "manual_axis_type",
     ],
 )
 def gmm(
@@ -334,6 +338,7 @@ def gmm(
     group_offset: jax.Array | None = None,
     transpose_rhs: bool = False,
     interpret: bool = False,
+    manual_axis_type: jax.sharding.ManualAxisType | None = None,
     # dynamic in kernel quantization support
     lhs_qdtype: jnp.dtype | None = None,
     lhs_static_scale: float | None = None,
@@ -356,14 +361,15 @@ def gmm(
     transpose_rhs: True if the rhs needs to be transposed.
     interpret: Whether or not to run the kernel in interpret mode, helpful for
       testing and debugging.
+    manual_axis_type: Manual axis type for the operation
+      https://docs.jax.dev/en/latest/notebooks/shard_map.html.
     lhs_qdtype: Quant dtype to quantize lhs to if lhs is not already quantized.
     lhs_static_scale: Compile-time scale when quantizing lhs instead of
       computing it from lhs values.
     rhs_qdtype: Quant dtype to quantize rhs to if rhs is not already quantized.
     rhs_static_scale: Compile-time scale when quantizing rhs instead of
       computing it from rhs values.
-    activation: Activation function to apply to the output of the dot
-      operation.
+    activation: Activation function to apply to the output of the dot operation.
 
   Returns:
     A 2d, jax.Array with shape [m, n].
@@ -565,7 +571,7 @@ def gmm(
   cost_estimate = pl.CostEstimate(
       flops=2 * m * k * n, bytes_accessed=bytes_accessed, transcendentals=0
   )
-  kernel_name = "gmm_megablox"
+  kernel_name = _KERNEL_NAME_GMM
   if transpose_rhs:
     kernel_name += "_transpose_rhs"
   metadata = dict(
@@ -576,7 +582,9 @@ def gmm(
   )
   call_gmm = common.custom_buffered_pallas_call(
       functools.partial(kernel, subchannel_iters=subchannel_iters),
-      out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
+      out_shape=jax.ShapeDtypeStruct(
+          (m, n), out_dtype, manual_axis_type=manual_axis_type
+      ),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=2,
           in_specs=[lhs_block_spec, rhs_block_spec],
@@ -621,6 +629,7 @@ def gmm(
         "rhs_static_scale",
         "activation",
         "combine_scopes",
+        "manual_axis_type",
     ],
 )
 def tgmm(
@@ -634,6 +643,7 @@ def tgmm(
     group_offset: jax.Array | None = None,
     num_actual_groups: int | None = None,
     interpret: bool = False,
+    manual_axis_type: jax.sharding.ManualAxisType | None = None,
     # dynamic in kernel quantization support
     lhs_qdtype: jnp.dtype | None = None,
     lhs_static_scale: float | None = None,
@@ -658,14 +668,14 @@ def tgmm(
       the groups that are local, starting from group_offset.
     interpret: Whether or not to run the kernel in interpret mode, helpful for
       testing and debugging.
+    manual_axis_type: Manual axis type for the operation.
     lhs_qdtype: Quant dtype to quantize lhs to if lhs is not already quantized.
     lhs_static_scale: Compile-time scale when quantizing lhs instead of
       computing it from lhs values.
     rhs_qdtype: Quant dtype to quantize rhs to if rhs is not already quantized.
     rhs_static_scale: Compile-time scale when quantizing rhs instead of
       computing it from rhs values.
-    activation: Activation function to apply to the output of the dot
-      operation.
+    activation: Activation function to apply to the output of the dot operation.
 
   Returns:
     A  3d, jax.Array with shape [num_groups, k, n].
@@ -682,7 +692,7 @@ def tgmm(
   n = rhs.shape[1]
   # the general tgmm definition requires lhs @ rhs
   # but our memory pipeline loads (m, k), (m, n) and computes (m, k)^T @ (m, n)
-  lhs = jax.tree.map(lambda x: x.mT, lhs)
+  lhs = jax.tree.map(lambda x: x.mT, lhs)  # [k, m] -> [m, k]
 
   num_groups = group_sizes.shape[0]
   num_actual_groups = (
@@ -827,7 +837,9 @@ def tgmm(
             out_ref[...] = activation(jnp.zeros_like(out_ref))
           else:
             out_ref[...] = jnp.zeros_like(out_ref)
+
     else:
+
       @pl.when(is_prologue)
       def _stage1():
         with jax.named_scope("zero_accum"):
@@ -886,7 +898,7 @@ def tgmm(
       flops=2 * m * k * n, bytes_accessed=bytes_accessed, transcendentals=0
   )
 
-  kernel_name = "tgmm_megablox"
+  kernel_name = _KERNEL_NAME_TGMM
   metadata = dict(
       tiling=dict(tile_m=tm, tile_k=tk, tile_n=tn),
       prefer_element_type=jnp.dtype(out_dtype).name,
@@ -895,7 +907,11 @@ def tgmm(
   )
   call_gmm = common.custom_buffered_pallas_call(
       functools.partial(kernel, subchannel_iters=subchannel_iters),
-      out_shape=jax.ShapeDtypeStruct((num_actual_groups, k, n), out_dtype),
+      out_shape=jax.ShapeDtypeStruct(
+          (num_actual_groups, k, n),
+          out_dtype,
+          manual_axis_type=manual_axis_type,
+      ),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=2,
           in_specs=[lhs_block_spec, rhs_block_spec],

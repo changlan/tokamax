@@ -14,23 +14,31 @@
 # ==============================================================================
 """B200 Flash attention with Mosaic GPU."""
 
+import dataclasses
 import functools
+import itertools
 import math
+from typing import Any, cast
 
 import jax
 from jax import lax
+from jax.experimental.mosaic import gpu as mgpu
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.mosaic_gpu as plgpu
 from jax.extend import backend
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
+from jaxlib.mlir import ir
+from jaxlib.mlir.dialects import arith
+from jaxlib.mlir.dialects import nvvm
+from jaxlib.mlir.dialects import vector
 import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_gpu as mgpu_lib
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
-
 
 DotPrecisionLike = lax.Precision | lax.DotAlgorithmPreset
 PagingInfo = base.PagingInfo
@@ -43,7 +51,7 @@ _TMEM_COL = _TMEM.reduce(0)
 _TMEM_ROW = _TMEM.reduce(1)
 _TCGEN05 = plgpu.Layout.TCGEN05
 _TCGEN05_ROW = _TCGEN05.reduce(1)
-_DEFAULT_MASK_VALUE = -1e30
+_WG_SPLAT = plgpu.Layout.WG_SPLAT
 
 _MMA_TMA_WG = 0
 _SOFTMAX_WG = 1
@@ -52,83 +60,235 @@ _MMA_WARP = 0
 _TMA_LOAD_QK_WARP = 1
 _TMA_LOAD_V_WARP = 2
 _TMA_LOAD_MASK_WARP = 3
+_L_PRODUCED = 4
+_L_CONSUMED = 5
+_ALPHA_PRODUCED = 6  # There are two barriers for alpha.
 
 _load_bcast = common.load_bcast
 
+_MASK_PACK_DTYPE = jnp.int8
+_MASK_PACKED_BITS = mgpu_lib.num_bits(_MASK_PACK_DTYPE)
+_MIN_MASK_COLS = 128 // _MASK_PACKED_BITS
+
+_FORBID_EXTRA = pydantic.ConfigDict(extra="forbid")
+
 
 @pydantic.dataclasses.dataclass(
-    frozen=True, kw_only=True, slots=True, config=dict(extra="forbid")
-)  # pytype: disable=wrong-keyword-args
+    frozen=True, kw_only=True, slots=True, config=_FORBID_EXTRA
+)
 class Config(common.ConfigBase):
   """Configuration parameters for Pallas-Mosaic-GPU kernels on SM100 GPUs.
 
   Attributes:
-    block_d: Block size along head_dim for updating accumulator.
     num_tma_splits: Number of chunks to load each K/V - helpful to better hide
       GMEM load latences as we can notify TMA warp after part of the mma, thus
       giving more time to TMA loads.
     collective: if True - 2 CTA MMA will be run with M=256, N=128
   """
 
-  # TODO: Relax block size constraints to multiple of 32.
-  block_d: pydantic.conint(multiple_of=8, gt=0) = 128
-  num_tma_splits: pydantic.PositiveInt = 2
+  num_tma_splits: pydantic.PositiveInt = 1
   collective: pydantic.StrictBool = True
+  persistent: pydantic.StrictBool = False
+
+  def __post_init__(self):
+    block_q_per_cta = self.block_q // 2 if self.collective else self.block_q
+    if block_q_per_cta < 128:
+      raise ValueError(
+          "For SM100 attention forward, block_q per CTA must be at least 128 "
+          f"to support TMEM slicing. Got block_q={self.block_q} with "
+          f"collective={self.collective}."
+      )
 
 
-def get_heuristics_config(ba: op.BoundArguments) -> Config:
+def _pad_to_swizzle(q, k, v, collective):
+  q, k, v = map(common.pad_head_dim_to_next_multiple_of_min_swizzle, (q, k, v))
+  if collective:
+    m = 2 * 8 * common.MIN_SWIZZLE // mgpu_lib.num_bits(v.dtype)
+    v = shape_lib.pad_to_next_multiple_of(v, m, -1)  # Need >=32 bytes per CTA.
+  return q, k, v
+
+
+def _get_scratch_types(
+    q, k, v, bias, mask, out_dtype, config, *, normalize_output
+) -> dict[str, Any]:
+  """Returns the scratch types for the kernel."""
+  head_dim = q.shape[-1]
+  head_dim_out = v.shape[-1]
+
+  block_kv = config.block_kv
+  num_stages = config.num_stages
+  num_tma_splits = config.num_tma_splits
+  softmax_slots = 2
+
+  if collective := config.collective:
+    tile_q = config.block_q // 2
+    tile_k = config.block_kv // 2
+    maybe_cluster_barrier = functools.partial(
+        plgpu.ClusterBarrier, collective_axes=("cluster",), leader_tracked=True
+    )
+  else:
+    tile_q = config.block_q
+    tile_k = config.block_kv
+    maybe_cluster_barrier = plgpu.Barrier
+
+  epi_tile_d = 1024 // mgpu_lib.num_bits(out_dtype)
+  if head_dim_out % epi_tile_d != 0:
+    epi_tile_d = head_dim_out
+  num_epi_slots = min(2, head_dim_out // epi_tile_d)
+
+  block_d = head_dim // num_tma_splits
+  k_block_shape = (num_stages, num_tma_splits, tile_k, block_d)
+  tile_d = head_dim_out // num_tma_splits // (2 if collective else 1)
+  v_block_shape = (num_stages, num_tma_splits, block_kv, tile_d)
+
+  kv_produced = plgpu.Barrier(
+      num_barriers=num_stages, num_arrivals=num_tma_splits
+  )
+  kv_consumed = plgpu.Barrier(
+      num_barriers=(num_stages, num_tma_splits), orders_tensor_core=True
+  )
+
+  tiled_smem = mgpu_lib.tiled_swizzled_smem
+
+  def tmem(shape, dtype=jnp.float32, **kwargs):
+    return plgpu.TMEM(shape, dtype, collective=collective, **kwargs)
+
+  q_scratch = tiled_smem((tile_q, head_dim), q.dtype, "q")
+  k_scratch = tiled_smem(k_block_shape, k.dtype, "k")
+  v_scratch = tiled_smem(v_block_shape, v.dtype, "v")
+  o_scratch = tiled_smem((num_epi_slots, tile_q, epi_tile_d), out_dtype, "o")
+
+  if config.persistent:
+    qkvo_scratch = ((q_scratch, k_scratch, v_scratch), o_scratch)
+  else:
+    qkvo_scratch = plgpu.RefUnion((q_scratch, k_scratch, v_scratch), o_scratch)
+
+  scratch = dict(
+      qkvo_smems=qkvo_scratch,
+      alpha_smem=plgpu.SMEM((softmax_slots, tile_q), jnp.float32),
+      s_tmem=tmem((tile_q, block_kv)),
+      p_tmem=tmem((softmax_slots, tile_q, block_kv), v.dtype, packed=True),
+      acc_tmem=tmem((tile_q, head_dim_out)),
+      q_produced=plgpu.Barrier(),
+      k_produced=kv_produced,
+      k_consumed=kv_consumed,
+      v_produced=kv_produced,
+      v_consumed=kv_consumed,
+      s_produced=plgpu.Barrier(orders_tensor_core=True),
+      s_consumed=maybe_cluster_barrier(),
+      pv_mma_produced=plgpu.Barrier(orders_tensor_core=True),
+      p_produced=maybe_cluster_barrier(num_barriers=2),
+      acc_produced=maybe_cluster_barrier(num_barriers=num_tma_splits),
+  )
+
+  if config.persistent:
+    scratch["q_consumed"] = plgpu.Barrier(orders_tensor_core=True)
+
+  if bias is not None and bias.shape[-2] != 1 and bias.shape[-1] != 1:
+    scratch["bias_smem"] = tiled_smem((tile_q, block_kv), bias.dtype, "bias")
+    scratch["bias_produced"] = plgpu.Barrier()
+    scratch["bias_consumed"] = plgpu.Barrier()
+
+  if mask is not None and mask.shape[-2] != 1 and mask.shape[-1] != 1:
+    shape = (tile_q, max(block_kv // _MASK_PACKED_BITS, _MIN_MASK_COLS))
+    scratch["mask_smem"] = plgpu.SMEM(shape, _MASK_PACK_DTYPE)
+    scratch["mask_produced"] = plgpu.Barrier()
+    scratch["mask_consumed"] = plgpu.Barrier()
+
+  if normalize_output:
+    scratch["li_smem"] = plgpu.SMEM((tile_q,), jnp.float32)
+
+  return scratch
+
+
+def _eval_input_shapes(ba, *, collective, fold_q_sequence_heads, split_k):
+  q, k, v, bias, mask = common.eval_input_shapes(
+      ba, fold_q_sequence_heads=fold_q_sequence_heads, split_k=split_k
+  )
+  pad = functools.partial(_pad_to_swizzle, collective=collective)
+  return *jax.eval_shape(pad, q, k, v), bias, mask
+
+
+def get_heuristics_config(
+    ba: op.BoundArguments, fold_q_sequence_heads: bool
+) -> Config:
   """Returns a heuristic configuration for flash attention on SM100 GPUs."""
-  q, _, v, *_ = ba.args
-  *batch_size, q_seq_len, q_heads, head_dim = q.shape
-  head_dim = pl.cdiv(max(head_dim, v.shape[-1]), 64) * 64
-  batch_size = math.prod(batch_size)
-  kv_seq_len = v.shape[-3]
-  num_tma_splits = 2 if head_dim == 256 else 1
-  collective = True
-  cluster_size = 1 + int(collective)
-  num_stages = max(256 // head_dim, 1) * cluster_size
-  block_q = 256 if collective else 128
-  block_kv = 128
+  out_dtype = ba.args[0].dtype
+  norm = ba.kwargs["normalize_output"]
+  collective = False
   split_k = 1
 
-  mask = ba.kwargs.get("mask", None)
+  eval_in_shapes = functools.partial(
+      _eval_input_shapes,
+      ba,
+      collective=collective,
+      fold_q_sequence_heads=fold_q_sequence_heads,
+  )
+
+  q, _, v, _, _ = eval_in_shapes(split_k=split_k)
+  *batch_size, q_seq_len, q_heads, head_dim = q.shape
+  head_dim = pl.cdiv(max(head_dim, v.shape[-1]), 64) * 64
+  kv_seq_len = v.shape[-3]
+  num_tma_splits = 2 if head_dim >= 256 else 1
+  cluster_size = 2 if collective else 1
+  num_stages = max(256 // head_dim, 1) * cluster_size
+  block_q = 128 * cluster_size
+  block_kv = 128
+
   # We use 0.5 threshold here as a safe choice for automatic K-split usage.
   # For other cases like 0.8 etc. we need a smarter heuristic or autotuning.
   min_load_factor = 0.5
-  grid_size = batch_size * pl.cdiv(q_seq_len, block_q) * q_heads
-  num_ctas = backend.get_default_device().core_count // cluster_size
-  # We do not support k split yet for causal attn or with k ranges
-  not_masked = mask is None or not (
-      mask.is_causal or mask.k_start is not None or mask.k_end is not None
-  )
-  is_kv_seq_aligned = kv_seq_len % block_kv == 0
-  # TODO fix test failures for non aligned q seq
-  is_q_seq_aligned = q_seq_len % block_q == 0
+  grid_size = math.prod(batch_size) * pl.cdiv(q_seq_len, block_q) * q_heads
+  num_clusters = backend.get_default_device().core_count // cluster_size
   if (
-      grid_size / num_ctas < min_load_factor
-      and is_kv_seq_aligned
-      and is_q_seq_aligned
-      and not_masked
+      grid_size / num_clusters < min_load_factor
+      # We do not support k split yet for causal masking or k-ranges.
+      # TODO fix test failures for non aligned q seq
+      and q_seq_len % block_q == 0
+      and kv_seq_len % block_kv == 0
+      and not ba.kwargs["mask"].is_causal
+      and ba.kwargs["mask"].k_start is None
+      and ba.kwargs["mask"].k_end is None
   ):
-    split_k = num_ctas // grid_size
+    split_k = num_clusters // grid_size
     split_k = min(kv_seq_len // block_kv, split_k)
     while kv_seq_len % split_k != 0:
       split_k -= 1
 
-  return Config(
+  q, k, v, bias, mask = eval_in_shapes(split_k=split_k)
+  config = Config(
       block_q=block_q,
       block_kv=block_kv,
-      block_d=128,
       collective=collective,
-      num_stages=num_stages,
+      num_stages=num_stages + 1,  # We pre-decrement below.
       num_tma_splits=num_tma_splits,
       split_k=split_k,
+      fold_q_sequence_heads=fold_q_sequence_heads,
+      persistent=not ba.kwargs["mask"].is_causal,
   )
+
+  while config.num_stages > 1:
+    config = dataclasses.replace(config, num_stages=config.num_stages - 1)
+    scratch = _get_scratch_types(
+        q, k, v, bias, mask, out_dtype, config, normalize_output=norm
+    )
+    smem_bytes = mgpu_lib.estimate_smem_bytes(
+        scratch, uses_dynamic_scheduling_loop=config.persistent
+    )
+    if smem_bytes <= 227 * 1024:
+      return config
+
+  return dataclasses.replace(config, persistent=False)
 
 
 def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
   """Returns a set of configs for autotuning flash attention on SM100 GPUs."""
-  del ba
+  out_dtype = ba.args[0].dtype
+  norm = ba.kwargs.get("normalize_output")
+  eval_in_shapes = functools.partial(
+      _eval_input_shapes, ba, fold_q_sequence_heads=False
+  )
+
   configs = set()
   for block_kv in [64, 128]:
     for num_stages in [1, 2, 3, 4]:
@@ -136,16 +296,35 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
         # TODO: Investigate why split_k=2 doesn't work with block_kv=128.
         for split_k in [1, 2] if block_kv == 64 else [1]:
           for collective in [False, True] if split_k == 1 else [False]:
-            configs.add(
-                Config(
-                    block_q=256 if collective else 128,
-                    block_kv=block_kv,
-                    num_stages=num_stages,
-                    num_tma_splits=num_tma_splits,
-                    collective=collective,
-                    split_k=split_k,
-                )
-            )
+            for persistent in [False, True]:
+              q, k, v, bias, mask = eval_in_shapes(
+                  collective=collective, split_k=split_k
+              )
+
+              if (k.shape[-1] // num_tma_splits) % 64 != 0:
+                continue
+
+              tile_d = v.shape[-1] // num_tma_splits // (2 if collective else 1)
+              if tile_d % 64 != 0:
+                continue
+
+              config = Config(
+                  block_q=256 if collective else 128,
+                  block_kv=block_kv,
+                  num_stages=num_stages,
+                  num_tma_splits=num_tma_splits,
+                  collective=collective,
+                  split_k=split_k,
+                  persistent=persistent,
+              )
+              scratch = _get_scratch_types(
+                  q, k, v, bias, mask, out_dtype, config, normalize_output=norm
+              )
+              smem_bytes = mgpu_lib.estimate_smem_bytes(
+                  scratch, uses_dynamic_scheduling_loop=persistent
+              )
+              if smem_bytes <= 227 * 1024:
+                configs.add(config)
   return configs
 
 
@@ -165,28 +344,22 @@ def flash_attention_kernel(
     out_dtype: jnp.dtype,
     normalize_output: bool,
     return_residuals: bool,
-    use_base2: bool,
     use_stable_softmax: bool,
+    rescale_threshold: float,
     config: Config,
 ) -> tuple[Float[Array, "T H d"], Residuals | None]:
   """SM100 Pallas Mosaic GPU Flash Attention."""
 
-  if bias is not None:
-    raise NotImplementedError("Bias is not supported on sm100.")
-
   if not use_stable_softmax:
     raise NotImplementedError("Unstable softmax not supported on sm100.")
 
-  if out_dtype != q.dtype:
-    # TODO: Support other out_dtypes.
-    raise NotImplementedError(f"{out_dtype=} != {q.dtype=} unsupported.")
+  orig_q_seq_len = q.shape[0]
+  q = shape_lib.pad_to_next_multiple_of(q, 8, 0)
 
-  orig_q_seq_len, num_q_heads, _ = q.shape
+  q_seq_len, num_q_heads, _ = q.shape
   dtype = q.dtype
 
   kv_seq_len, num_kv_heads, orig_head_dim_out = v.shape
-  if kv_seq_len % config.block_kv:
-    raise ValueError(f"{kv_seq_len=} must be a multiple of {config.block_kv=}")
   if num_q_heads % num_kv_heads:
     raise ValueError(f"{num_q_heads=} must be divisible by {num_kv_heads=}")
   q_heads_per_kv_head = num_q_heads // num_kv_heads
@@ -195,586 +368,590 @@ def flash_attention_kernel(
         f"Only f16 and bf16 are supported, got dtype: {dtype}"
     )
 
-  pad_head_dim = lambda x: shape_lib.pad_to_next_multiple_of(x, 64, -1)
-  q, k, v = map(pad_head_dim, (q, k, v))
-  q = shape_lib.pad_to_next_multiple_of(q, 8, -3)
-  q_seq_len, _, head_dim = q.shape
+  if not config.collective and config.block_kv < 128:
+    raise NotImplementedError(  # TODO
+        "This config has been found to cause intermitted invalid instruction"
+        " errors. Possible cause is barrier state at the end of the kernel."
+    )
+
+  q, k, v = _pad_to_swizzle(q, k, v, collective=config.collective)
+  head_dim = q.shape[-1]
   head_dim_out = v.shape[-1]
 
-  if mask is None:
-    apply_bool_mask = bcast_mask_q = bcast_mask_k = False
-  else:
-    apply_bool_mask = True
-    bcast_mask_q = mask.shape[-2] == 1
-    bcast_mask_k = mask.shape[-1] == 1
-    mask = mask.astype(jnp.int8)
+  if mask is not None:
+    if mask.shape[-2] == 1 or mask.shape[-1] == 1:
+      mask = mask.astype(jnp.int8)
+    else:
+      mask = jnp.packbits(mask, axis=-1, bitorder="little")
+      mask = mask.view(_MASK_PACK_DTYPE)
+      mask = shape_lib.pad_to_next_multiple_of(mask, m=_MIN_MASK_COLS, axis=-1)
 
-  use_2d_bool_mask = apply_bool_mask and not (bcast_mask_k or bcast_mask_q)
-
-  tile_q, block_kv = config.block_q, config.block_kv
-  num_q_tiles = pl.cdiv(q_seq_len, tile_q)
+  block_q = config.block_q
+  block_kv = config.block_kv
+  num_q_tiles = pl.cdiv(q_seq_len, block_q)
+  mask_block_kv = block_kv // _MASK_PACKED_BITS
+  mask_block_size = max(mask_block_kv, _MIN_MASK_COLS)
   num_stages = config.num_stages
-  num_tma_splits = config.num_tma_splits if head_dim >= 128 else 1
-  collective = config.collective
-  block_q = tile_q // 2 if collective else tile_q
-  collective_axis = "x" if collective else None
-  softmax_slots = 2
+  num_tma_splits = config.num_tma_splits
 
-  def kernel(*refs, scoped):
-    smem_buffers, buffer_barriers = scoped
-    (
-        (q_smem, o_smem),
-        k_smem,
-        v_smem,
-        p_tmem,
-        mask_smem,
-        alpha_smem,
-        li_smem,
-        acc_tmem,
-        qk_acc_tmem,
-    ) = smem_buffers
-    (
-        q_gmem,
-        k_gmem,
-        v_gmem,
-        mask_gmem,
-        k_start_gmem,
-        k_end_gmem,
-        k_start_minmax_gmems,
-        k_end_minmax_gmems,
-        out_gmem,
-        *residual_gmems,
-    ) = refs
+  if collective := config.collective:
+    tile_q = block_q // 2
+    collective_axis = "cluster"
+  else:
+    tile_q = block_q
+    collective_axis = None
 
-    (
-        q_barrier,
-        k_barrier,
-        v_barrier,
-        mask_produced_barrier,
-        mask_consumed_barrier,
-        # Q@K
-        qk_mma_barrier,
-        k_consumed_barrier,
-        qk_consumed_barrier,
-        # P@V
-        pv_mma_barrier,
-        v_consumed_barrier,
-        p_produced_barrier,
-        p_consumed_barrier,
-        alpha_produced_barrier,
-        out_scaled_barrier,
-    ) = buffer_barriers
-
-    qi = lax.axis_index("q_tiles")
-    hi = lax.axis_index("heads")
+  def kernel(
+      grid_loop,
+      *,
+      qkvo_smems,
+      mask_smem=None,
+      alpha_smem,
+      li_smem=None,
+      s_tmem,
+      p_tmem,
+      acc_tmem,
+      bias_smem=None,
+      q_produced,
+      q_consumed=None,
+      k_produced,
+      k_consumed,
+      v_produced,
+      v_consumed,
+      bias_produced=None,
+      bias_consumed=None,
+      mask_produced=None,
+      mask_consumed=None,
+      s_produced,
+      s_consumed,
+      pv_mma_produced,
+      p_produced,
+      acc_produced,
+  ):
+    (q_smem, k_smem, v_smem), o_smem = qkvo_smems
     wg = lax.axis_index("wg")
-    cluster_idx = lax.axis_index("x")
+    cluster_idx = lax.axis_index("cluster")
 
-    q_base_cluster = qi * tile_q
-    q_base = q_base_cluster + cluster_idx * block_q
-    qs = pl.ds(q_base, block_q)
+    @grid_loop(init_carry=0)
+    def grid_loop_body(gmems, loop_info: plgpu.NDLoopInfo, carry):
+      prev_iters = carry
+      (
+          q_gmem,
+          k_gmem,
+          v_gmem,
+          bias_gmem,
+          mask_gmem,
+          k_start_gmem,
+          k_end_gmem,
+          k_start_minmax_gmems,
+          k_end_minmax_gmems,
+          o_gmem,
+          *residual_gmems,
+      ) = gmems
+      hi, qi = loop_info.index
+      if is_causal:
+        qi = num_q_tiles - 1 - qi
 
-    use_k_ranges = k_start_gmem is not None or k_end_gmem is not None
+      q_base_cluster = qi * block_q
+      q_base = q_base_cluster + cluster_idx * tile_q
+      qs = cast(pl.Slice, pl.ds(q_base, tile_q))
 
-    lb = 0
-    ub = kv_seq_len // block_kv
+      lb = 0
+      ub = kv_seq_len // block_kv
 
-    if is_causal:
-      ub = lax.min(ub, pl.cdiv(q_base_cluster + tile_q, block_kv))
+      if is_causal:
+        ub = lax.min(ub, pl.cdiv(q_base_cluster + block_q, block_kv))
 
-    def load_k_bound(k_range_ref):
-      idx = (
-          lax.min(hi, k_range_ref.shape[-2] - 1),
-          0 if k_range_ref.shape[-1] == 1 else qi,
-      )
-      return plgpu.load(k_range_ref, idx=idx, layout=plgpu.Layout.WG_SPLAT)
+      def load_k_bound(k_range_ref):
+        idx = (
+            lax.min(hi, k_range_ref.shape[-2] - 1),
+            0 if k_range_ref.shape[-1] == 1 else qi,
+        )
+        return plgpu.load(k_range_ref.at[idx], layout=plgpu.Layout.WG_SPLAT)
 
-    if k_start_minmax_gmems is None:
-      k_start_max = None
-    else:
-      k_start_min, k_start_max = map(load_k_bound, k_start_minmax_gmems)
-      lb = lax.max(lb, lax.div(k_start_min, block_kv))
+      if k_start_minmax_gmems is None:
+        k_start_max = None
+      else:
+        k_start_min, k_start_max = map(load_k_bound, k_start_minmax_gmems)
+        lb = lax.max(lb, lax.div(k_start_min, block_kv))
 
-    if k_end_minmax_gmems is None:
-      k_end_min = None
-    else:
-      k_end_min, k_end_max = map(load_k_bound, k_end_minmax_gmems)
-      ub = lax.min(ub, pl.cdiv(k_end_max, block_kv))
+      if k_end_minmax_gmems is None:
+        k_end_min = None
+      else:
+        k_end_min, k_end_max = map(load_k_bound, k_end_minmax_gmems)
+        ub = lax.min(ub, pl.cdiv(k_end_max, block_kv))
 
-    @pl.when((wg == _MMA_TMA_WG) & (ub > lb))
-    def mma_tma_wg():
-      plgpu.set_max_registers(80, action="decrease")
+      @pl.when(wg == _MMA_TMA_WG)
+      def mma_tma_wg():
+        plgpu.set_max_registers(80, action="decrease")
 
-      @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
-      def per_warp():
-        warp_id = lax.axis_index("warp")
+        @plgpu.warp_map
+        def per_warp(warp_id):
 
-        def tma_load_kv(gmem, smem, barrier, partitioned_axis, ki, split_idx):
-          kv_head = lax.div(hi, q_heads_per_kv_head)
-          si = lax.rem(ki - lb, num_stages)
-          block_d = gmem.shape[-1] // num_tma_splits
-          ds = pl.ds(split_idx * block_d, block_d)
-          plgpu.copy_gmem_to_smem(
-              gmem.at[pl.ds(ki * block_kv, block_kv), kv_head, ds],
-              smem.at[si, split_idx],
-              barrier=barrier.at[si],
-              partitioned_axis=partitioned_axis if collective else None,
-              collective_axes="x" if collective else None,
-          )
+          def tma_load_kv_warp(gmem, smem, produced, consumed, partition_axis):
+            kv_head = lax.div(hi, q_heads_per_kv_head)
+            block_d = gmem.shape[-1] // num_tma_splits
+            if collective:
+              leader_tracked = plgpu.CopyPartition.PARTITIONED(partition_axis)
+            else:
+              leader_tracked = None
 
-        def tma_load_kv_warp(
-            gmem, smem, barrier, consumed_barrier, partitioned_axis
-        ):
-          tma_load = functools.partial(
-              tma_load_kv, gmem, smem, barrier, partitioned_axis
-          )
-
-          @pl.loop(lb, lax.min(lb + num_stages, ub))
-          def prologue(ki):
-            pl.loop(0, num_tma_splits)(functools.partial(tma_load, ki))
-
-          @pl.loop(lb + num_stages, ub)
-          def kv_loop(ki):
-            si = lax.rem(ki - lb, num_stages)
-
-            @pl.loop(0, num_tma_splits)
-            def tma_loop(split_idx):
-              slot = si * num_tma_splits + split_idx
-              plgpu.barrier_wait(consumed_barrier.at[slot])
-              tma_load(ki, split_idx)
-
-        @pl.when(warp_id == _TMA_LOAD_QK_WARP)
-        def tma_load_qk_warp():
-          plgpu.copy_gmem_to_smem(
-              q_gmem.at[pl.ds(q_base_cluster, tile_q), hi],
-              q_smem,
-              barrier=q_barrier,
-              partitioned_axis=0 if collective else None,
-              collective_axes=(collective_axis,) if collective else None,
-          )
-          tma_load_kv_warp(
-              k_gmem, k_smem, k_barrier, k_consumed_barrier, partitioned_axis=0
-          )
-
-        @pl.when(warp_id == _TMA_LOAD_V_WARP)
-        def tma_load_v_warp():
-          tma_load_kv_warp(
-              v_gmem, v_smem, v_barrier, v_consumed_barrier, partitioned_axis=1
-          )
-
-        if use_2d_bool_mask:
-
-          @pl.when(warp_id == _TMA_LOAD_MASK_WARP)
-          def tma_load_mask_warp():
+            @pl.when(loop_info.local_index == 0)
+            def prologue():
+              for si in range(num_stages):
+                for i in range(num_tma_splits):
+                  plgpu.barrier_arrive(consumed.at[si, i])
 
             @pl.loop(lb, ub)
             def kv_loop(ki):
-              hi_ = 0 if mask_gmem.shape[-3] == 1 else hi
+              si = lax.rem(prev_iters + ki - lb, num_stages)
               ks = pl.ds(ki * block_kv, block_kv)
-              plgpu.copy_gmem_to_smem(
-                  mask_gmem.at[hi_, qs, ks], mask_smem, mask_produced_barrier
+
+              for i in range(num_tma_splits):
+                ds = pl.ds(i * block_d, block_d)
+                plgpu.barrier_wait(consumed.at[si, i])
+                plgpu.copy_gmem_to_smem(
+                    gmem.at[ks, kv_head, ds],
+                    smem.at[si, i],
+                    barrier=produced.at[si],
+                    collective_axes=collective_axis,
+                    leader_tracked=leader_tracked,
+                )
+
+          @pl.when(warp_id == _TMA_LOAD_QK_WARP)
+          def tma_load_qk_warp():
+
+            if q_consumed is not None:
+
+              @pl.when(loop_info.local_index == 0)
+              def prologue():
+                plgpu.barrier_arrive(q_consumed)
+
+            @pl.when(ub > lb)
+            def load_q():
+              qs = pl.ds(q_base_cluster, block_q)
+              leader_tracked = (
+                  plgpu.CopyPartition.PARTITIONED(0) if collective else None
               )
-              plgpu.barrier_wait(mask_consumed_barrier)
+              if q_consumed is not None:
+                plgpu.async_prefetch(
+                    q_gmem.at[qs, hi],
+                    collective_axes=collective_axis,
+                    leader_tracked=leader_tracked,
+                )
+                plgpu.barrier_wait(q_consumed)
+              plgpu.copy_gmem_to_smem(
+                  q_gmem.at[qs, hi],
+                  q_smem,
+                  barrier=q_produced,
+                  collective_axes=collective_axis,
+                  leader_tracked=leader_tracked,
+              )
 
-        @pl.when((warp_id == _MMA_WARP) & (cluster_idx == 0))
-        def mma_warp():
+            tma_load_kv_warp(k_gmem, k_smem, k_produced, k_consumed, 0)
 
-          def qk_mma(ki):
-            si = lax.rem(ki - lb, num_stages)
-            with jax.named_scope("wait_k"):
-              plgpu.barrier_wait(qk_consumed_barrier)
-              plgpu.barrier_wait(k_barrier.at[si])
+          @pl.when(warp_id == _TMA_LOAD_V_WARP)
+          def tma_load_v_warp():
+            tma_load_kv_warp(v_gmem, v_smem, v_produced, v_consumed, 1)
 
-            @pl.loop(0, num_tma_splits)
-            def tma_loop(split_idx):
+          if bias_smem is not None or mask_smem is not None:
+
+            @pl.when(warp_id == _TMA_LOAD_MASK_WARP)
+            def tma_load_bias_mask_warp():
+              @pl.loop(lb, ub)
+              def kv_loop(ki):
+                if bias_smem is not None:
+                  assert bias_produced is not None and bias_consumed is not None
+                  hi_ = 0 if bias_gmem.shape[-3] == 1 else hi
+                  ks = pl.ds(ki * block_kv, block_kv)
+                  plgpu.barrier_wait(bias_consumed)
+                  mgpu_lib.fence_async_shared_cta()
+                  plgpu.copy_gmem_to_smem(
+                      bias_gmem.at[hi_, qs, ks], bias_smem, bias_produced
+                  )
+                if mask_smem is not None:
+                  assert mask_produced is not None and mask_consumed is not None
+                  hi_ = 0 if mask_gmem.shape[-3] == 1 else hi
+                  ks = pl.ds(ki * mask_block_kv, mask_block_size)
+                  plgpu.barrier_wait(mask_consumed)
+                  mgpu_lib.fence_async_shared_cta()
+                  plgpu.copy_gmem_to_smem(
+                      mask_gmem.at[hi_, qs, ks], mask_smem, mask_produced
+                  )
+
+          @pl.when((warp_id == _MMA_WARP) & (cluster_idx == 0))
+          def mma_warp():
+
+            def qk_mma(ki):
               block_d = head_dim // num_tma_splits
-              ds = pl.ds(split_idx * block_d, block_d)
-              with jax.named_scope("issuing Q@K.T"):
-                plgpu.tcgen05_mma(
-                    qk_acc_tmem,
-                    q_smem.at[:, ds],
-                    k_smem.at[si, split_idx].T,
-                    k_consumed_barrier.at[si * num_tma_splits + split_idx],
-                    accumulate=split_idx > 0,
-                    collective_axis=collective_axis,
-                )
+              si = lax.rem(prev_iters + ki - lb, num_stages)
 
-            plgpu.tcgen05_commit_arrive(
-                qk_mma_barrier, collective_axis=collective_axis
-            )
+              with jax.named_scope("wait_k"):
+                plgpu.barrier_wait(s_consumed)
+                plgpu.barrier_wait(k_produced.at[si])
+                mgpu_lib.tcgen05_fence_after_thread_sync()
 
-          def pv_mma(ki):
-            si = lax.rem(ki - lb, num_stages)
-            slot = lax.rem(ki - lb, 2)
-            with jax.named_scope("wait_v"):
-              plgpu.barrier_wait(v_barrier.at[si])
-              plgpu.barrier_wait(p_produced_barrier.at[slot])
+              for i in range(num_tma_splits):
+                ds = pl.ds(i * block_d, block_d)
+                with jax.named_scope("issuing Q@K.T"):
+                  plgpu.tcgen05_mma(
+                      s_tmem,
+                      q_smem.at[:, ds],
+                      k_smem.at[si, i].T,
+                      k_consumed.at[si, i],
+                      accumulate=i > 0,
+                      collective_axis=collective_axis,
+                  )
 
-            @pl.loop(0, num_tma_splits)
-            def tma_loop(split_idx):
-              barrier_slot = si * num_tma_splits + split_idx
+              plgpu.tcgen05_commit_arrive(s_produced, collective_axis)
+
+            def pv_mma(ki):
               block_d = head_dim_out // num_tma_splits
-              ds = pl.ds(split_idx * block_d, block_d)
-              plgpu.barrier_wait(out_scaled_barrier.at[split_idx])
-              with jax.named_scope("issuing P@V"):
-                plgpu.tcgen05_mma(
-                    acc_tmem.at[:, ds],
-                    p_tmem.at[:, pl.ds(slot * block_kv, block_kv)],
-                    v_smem.at[si, split_idx],
-                    v_consumed_barrier.at[barrier_slot],
-                    accumulate=(ki != lb),
-                    collective_axis=collective_axis,
-                )
+              v_si = lax.rem(prev_iters + ki - lb, num_stages)
+              p_si = lax.rem(prev_iters + ki - lb, 2)
 
-            plgpu.tcgen05_commit_arrive(
-                pv_mma_barrier, collective_axis=collective_axis
-            )
-            plgpu.tcgen05_commit_arrive(
-                p_consumed_barrier.at[slot], collective_axis=collective_axis
-            )
+              with jax.named_scope("wait_v"):
+                plgpu.barrier_wait(v_produced.at[v_si])
+                plgpu.barrier_wait(p_produced.at[p_si])
 
-          plgpu.barrier_wait(q_barrier)
-          qk_mma(lb)
+              for i in range(num_tma_splits):
+                ds = pl.ds(i * block_d, block_d)
+                plgpu.barrier_wait(acc_produced.at[i])
+                mgpu_lib.tcgen05_fence_after_thread_sync()
+                with jax.named_scope("issuing P@V"):
+                    plgpu.tcgen05_mma(
+                        acc_tmem.at[:, ds],
+                        p_tmem.at[p_si],
+                        v_smem.at[v_si, i],
+                        v_consumed.at[v_si, i],
+                        accumulate=(ki != lb),
+                        collective_axis=collective_axis,
+                    )
 
-          @pl.loop(lb, ub - 1)
-          def kv_loop(ki):
-            qk_mma(ki + 1)
-            pv_mma(ki)
+              plgpu.tcgen05_commit_arrive(pv_mma_produced, collective_axis)
 
-          pv_mma(ub - 1)
+            @pl.when(ub > lb)
+            def compute():
+              plgpu.barrier_wait(q_produced)
+              qk_mma(lb)
 
-    @pl.when((wg == _SOFTMAX_WG) & (ub > lb))
-    def softmax_wg():
-      plgpu.set_max_registers(256, action="increase")
+              @pl.loop(lb, ub - 1)
+              def kv_loop(ki):
+                qk_mma(ki + 1)
+                pv_mma(ki)
 
-      m_i = plgpu.layout_cast(
-          jnp.full((block_q,), -jnp.inf, jnp.float32), _TMEM_ROW
-      )
-      l_i = plgpu.layout_cast(jnp.zeros_like(m_i), _TMEM_ROW)
+              if q_consumed is not None:
+                plgpu.tcgen05_commit_arrive(q_consumed, collective_axis)
+              pv_mma(ub - 1)
 
-      load_k_range = lambda r: _load_bcast(r, (hi, qs), layout=_TMEM_ROW)
-      k_start = None if k_start_gmem is None else load_k_range(k_start_gmem)
-      k_end = None if k_end_gmem is None else load_k_range(k_end_gmem)
+      @pl.when(wg == _SOFTMAX_WG)
+      def softmax_wg():
+        plgpu.set_max_registers(256, action="increase")
 
-      def need_apply_k_range_mask(ki):
-        need_apply = False
-        if not use_k_ranges:
-          return need_apply
-        k_base = ki * block_kv
-        if k_end is not None:
-          need_apply = jnp.logical_or(need_apply, k_base + block_kv > k_end_min)
-        if k_start is not None:
-          need_apply = jnp.logical_or(need_apply, k_base < k_start_max)
-        return need_apply
+        @pl.when(loop_info.local_index == 0)
+        def prologue():
+          plgpu.barrier_arrive(s_consumed)
+          if bias_consumed is not None:
+            plgpu.barrier_arrive(bias_consumed)
+          if mask_consumed is not None:
+            plgpu.barrier_arrive(mask_consumed)
 
-      def compute_qk_mask(ki, do_causal):
-        acc_shape = (block_q, block_kv)
-        if not (do_causal or apply_bool_mask or use_k_ranges):
-          # not mask needed
-          return None
-        iota = lambda d: plgpu.broadcasted_iota(
-            jnp.int32, acc_shape, dimension=d, layout=_TMEM
-        )
-        mask = plgpu.layout_cast(jnp.ones(acc_shape, dtype=jnp.bool_), _TMEM)
-
-        if do_causal:
-          mask &= (iota(0) + q_base) >= (iota(1) + ki * block_kv)
-        if apply_bool_mask:
-          if use_2d_bool_mask:
-            plgpu.barrier_wait(mask_produced_barrier)
-            mask &= plgpu.load(mask_smem, (), layout=_TMEM, optimized=False)
-            plgpu.barrier_arrive(mask_consumed_barrier)
-          else:
-            hi_ = 0 if mask_gmem.shape[-3] == 1 else hi
-            if bcast_mask_q:
-              idx = (hi_, 0, pl.ds(ki * block_kv, block_kv))
-              layout = _TMEM_COL
-            else:
-              idx = (hi_, qs, 0)
-              layout = _TMEM_ROW
-
-            mask_vector = plgpu.load(
-                mask_gmem, idx, layout=layout, optimized=False
-            )
-            bc_dim = 1 if bcast_mask_q else 0
-            # TODO: we need to handle Q masks differently
-            # broadcasting & using them the way it is done is extremely slow
-            mask &= plgpu.layout_cast(
-                lax.broadcast_in_dim(mask_vector, acc_shape, (bc_dim,)),
-                _TMEM,
-            )
-
-        if use_k_ranges:
-
-          def _krange_mask(mask):
-            bc_range = lambda x: lax.broadcast_in_dim(x, acc_shape, (0,))
-            block_kv_iota = iota(1) + (ki * block_kv)
-
-            if k_start_gmem is not None:
-              mask &= bc_range(k_start) <= block_kv_iota
-            if k_end_gmem is not None:
-              mask &= bc_range(k_end) > block_kv_iota
-            return mask
-
-          mask = lax.cond(
-              need_apply_k_range_mask(ki),
-              lambda: _krange_mask(mask),
-              lambda: mask,
+        @pl.when(ub > lb)
+        def compute():
+          m_i = plgpu.layout_cast(
+              jnp.full((tile_q,), -jnp.inf, jnp.float32), _TMEM_ROW
           )
-        return mask
+          l_i = plgpu.layout_cast(jnp.zeros_like(m_i), _TMEM_ROW)
 
-      def maybe_apply_mask(s, scale, ki, *, do_causal):
-        if not (apply_bool_mask or use_k_ranges or do_causal):
-          return s, scale
-        need_apply_mask = jnp.logical_or(
-            do_causal or apply_bool_mask, need_apply_k_range_mask(ki)
-        )
-        compute_mask_fn = lambda: jnp.where(
-            compute_qk_mask(ki, do_causal), 0, _DEFAULT_MASK_VALUE
-        )
-        return lax.cond(
-            need_apply_mask,
-            lambda: (s * scale + compute_mask_fn(), 1.0),
-            lambda: (s, scale),
-        )
+          load_k_range = lambda r: _load_bcast(r, (hi, qs), layout=_TMEM_ROW)
+          k_start = None if k_start_gmem is None else load_k_range(k_start_gmem)
+          k_end = None if k_end_gmem is None else load_k_range(k_end_gmem)
+          has_k_range = k_start is not None or k_end is not None
 
-      def kv_loop(ki, carry, *, do_causal=False):
-        m_i, l_i = carry
-        is_last_step = ki == ub - 1
-        si = lax.rem(ki - lb, 2)
-        with jax.named_scope("Q@K"):
-          plgpu.barrier_wait(qk_mma_barrier)
-        with jax.named_scope("load_qk"):
-          s = plgpu.async_load_tmem(qk_acc_tmem, layout=_TMEM)
-          scale = logits_scale
-          plgpu.wait_load_tmem()
-          plgpu.barrier_arrive(qk_consumed_barrier)
+          def needs_k_range_mask(ki):
+            needs_apply = False
+            if k_end_min is not None:
+              needs_apply |= ki * block_kv + block_kv > k_end_min
+            if k_start_max is not None:
+              needs_apply |= ki * block_kv < k_start_max
+            return needs_apply
 
-        if logits_soft_cap is not None:
-          s, scale = jnp.tanh(s * (scale / logits_soft_cap)), logits_soft_cap
-
-        with jax.named_scope("softmax"):
-          exp = jnp.exp2 if use_base2 else jnp.exp
-          if use_base2:
-            scale *= math.log2(math.e)
-          s, scale = maybe_apply_mask(s, scale, ki, do_causal=do_causal)
-          m_ij = jnp.maximum(m_i, s.max(axis=1) * scale)
-          with jax.named_scope("exp(SFU)"):
-            alpha = exp(m_i - m_ij)
-
-          @pl.when(ki > lb)
-          def write_alpha_to_smem():
-            alpha_smem.at[si][...] = alpha
-            plgpu.barrier_arrive(alpha_produced_barrier.at[si])
-
-          m_i = m_ij
-          with jax.named_scope("exp(SFU)"):
-            p = exp(s * scale - lax.broadcast_in_dim(m_ij, s.shape, [0]))
-          l_i *= alpha
-          l_i += p.sum(axis=1)
-          p16 = p.astype(p_tmem.dtype)
-
-          @pl.when(is_last_step)
-          def write_l_to_smem():
-            li_smem[...] = l_i
-
-          @pl.when(ki > lb + 1)
-          def wait_for_p_consumed():
-            with jax.named_scope("wait p_consumed"):
-              plgpu.barrier_wait(p_consumed_barrier.at[si])
-
-          with jax.named_scope("write qk_tmem"):
-            plgpu.async_store_tmem(
-                p_tmem.at[:, pl.ds(si * block_kv, block_kv)], p16
+          def compute_mask(ki, do_causal):
+            k_base = ki * block_kv
+            acc_shape = (tile_q, block_kv)
+            iota = lambda d: plgpu.broadcasted_iota(
+                jnp.int32, acc_shape, dimension=d, layout=_TMEM
             )
-            plgpu.commit_tmem()
-        plgpu.barrier_arrive(p_produced_barrier.at[si])
-        return m_i, l_i
 
-      # prologue
-      plgpu.barrier_arrive(qk_consumed_barrier)
+            if do_causal:
+              mask = (q_base + iota(0)) >= (k_base + iota(1))
+            else:
+              mask = plgpu.layout_cast(jnp.ones(acc_shape, dtype=bool), _TMEM)
 
-      # in 2CTA we have non square blocks hence we may need to process
-      # M//N steps with a mask, for M=256, N=128 this means 2 steps
-      causal_blocks = int(is_causal) * (tile_q // block_kv)
-      m_i, l_i = lax.fori_loop(lb, ub - causal_blocks, kv_loop, (m_i, l_i))
+            if mask_gmem is not None:
+              if mask_smem is None:
+                ks = cast(pl.Slice, pl.ds(k_base, block_kv))
+                # TODO: we need to handle Q masks differently
+                # broadcasting & using them the way it is done is extremely slow
+                mask &= _load_bcast(mask_gmem, (hi, qs, ks), layout=_TMEM)
+              else:
+                assert mask_produced is not None and mask_consumed is not None
+                plgpu.barrier_wait(mask_produced)
+                layout = _TMEM(32 // _MASK_PACKED_BITS)
+                mask_smem_ = mask_smem.at[:, :mask_block_kv]
+                mask_ = plgpu.load(mask_smem_, layout=layout, optimized=False)
+                plgpu.barrier_arrive(mask_consumed)
+                mask &= common.unpack_bool_bits_tmem_native(mask_)
 
-      if is_causal:
-        m_i, l_i = lax.fori_loop(
-            ub - causal_blocks,
-            ub,
-            functools.partial(kv_loop, do_causal=True),
-            (m_i, l_i),
-        )
+            def k_range_mask(mask):
+              bc_range = lambda x: lax.broadcast_in_dim(x, mask.shape, (0,))
+              if k_start_gmem is not None:
+                mask &= (k_base + iota(1)) >= bc_range(k_start)
+              if k_end_gmem is not None:
+                mask &= (k_base + iota(1)) < bc_range(k_end)
+              return mask
 
-      if return_residuals:
-        if use_base2:
-          m_i *= 1 / math.log2(math.e)
-        for residual, gmem_ref in zip((m_i, l_i), residual_gmems):
-          gmem_ref.at[hi, qs].set(residual.astype(gmem_ref.dtype))
+            return lax.cond(
+                needs_k_range_mask(ki), lambda: k_range_mask(mask), lambda: mask
+            )
 
-      l_i = plgpu.load(li_smem, (), layout=_TCGEN05_ROW, optimized=True)
-      l_i += float(jnp.finfo(jnp.float32).tiny)
+          def kv_loop(ki, carry, *, do_causal=False):
+            m_scale, m_i, l_i = carry
+            si = lax.rem(prev_iters + ki - lb, 2)
+            with jax.named_scope("Q@K"):
+              plgpu.barrier_wait(s_produced)
+            with jax.named_scope("load_qk"):
+              s = plgpu.async_load_tmem(s_tmem, layout=_TMEM)
+              scale = logits_scale
 
-      with jax.named_scope("wait mma"):
-        slot = lax.rem(ub - 1 - lb, softmax_slots)
-        plgpu.barrier_wait(p_consumed_barrier.at[slot])
+              if bias_gmem is None:
+                bias = None
+              elif bias_smem is None:
+                hi_ = 0 if bias_gmem.shape[-3] == 1 else hi
+                ks = cast(pl.Slice, pl.ds(ki * block_kv, block_kv))
+                bias = _load_bcast(bias_gmem, (hi_, qs, ks), layout=_TMEM)
+              else:
+                assert bias_produced is not None and bias_consumed is not None
+                plgpu.barrier_wait(bias_produced)
+                bias = plgpu.load(bias_smem, layout=_TMEM, optimized=False)
+                plgpu.barrier_arrive(bias_consumed)
 
-      # epilogue for writing GMEM
-      with jax.named_scope("TMEM -> SMEM"):
-        acc = plgpu.async_load_tmem(acc_tmem, layout=_TCGEN05)
-      with jax.named_scope("SMEM -> GMEM"):
-        if normalize_output:
-          acc *= lax.broadcast_in_dim(1.0 / l_i, acc.shape, [0])
-        o_smem[...] = acc.astype(dtype)
-        plgpu.commit_smem()
-        plgpu.copy_smem_to_gmem(o_smem, out_gmem.at[qs, hi])
-        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+              mgpu_lib.tcgen05_wait_ld()
+              mgpu_lib.tcgen05_fence_before_thread_sync()
+              if collective:  # Not all threads arrive on the barrier.
+                mgpu_lib.warpgroup_barrier()
+              plgpu.barrier_arrive(s_consumed)
 
-    @pl.when((wg == _SCALE_WG) & (ub > lb))
-    def scale_wg():
-      plgpu.set_max_registers(160, action="decrease")
+            if bias is not None:
+              s = s * scale + bias.astype(s.dtype)
+              scale = 1.0
 
-      for i in range(num_tma_splits):
-        plgpu.barrier_arrive(out_scaled_barrier.at[i])
+            if logits_soft_cap is not None:
+              s = jnp.tanh(s * (scale / logits_soft_cap))
+              scale = logits_soft_cap
 
-      @pl.loop(lb + 1, ub)
-      def kv_loop(ki):
-        slot = lax.rem(ki - lb, softmax_slots)
+            with jax.named_scope("softmax"):
+              s = lax.cond(
+                  do_causal or mask_gmem is not None or needs_k_range_mask(ki),
+                  lambda: jnp.where(compute_mask(ki, do_causal), s, -jnp.inf),
+                  lambda: s,
+              )
+              scale *= math.log2(math.e)
+              m_i = jnp.maximum(m_i, s.max(axis=1) * scale)
+              cannot_be_inf = mask_gmem is None and not has_k_range
+              m_valid = cannot_be_inf | (m_i != -jnp.inf)
+              alpha = jnp.where(m_valid, jnp.exp2(m_scale - m_i), 1.0)
 
-        plgpu.barrier_wait(pv_mma_barrier)
-        plgpu.barrier_wait(alpha_produced_barrier.at[slot])
-        alpha = plgpu.load(alpha_smem, slot, layout=_TMEM_ROW)
+              @pl.when(ki > lb)
+              def write_alpha_to_smem():
+                alpha_smem[si] = alpha
+                mgpu_lib.bar_arrive(_ALPHA_PRODUCED + si, num_threads=256)
 
-        with jax.named_scope("scale_acc"):
+              needs_rescale = (
+                  (rescale_threshold == 1.0)
+                  | (alpha < rescale_threshold)
+                  | ((not normalize_output) & (ki == ub - 1))
+              )
+              m_scale = jnp.where(needs_rescale, m_i, m_scale)
+              bcast = lambda x: lax.broadcast_in_dim(x, s.shape, [0])
+              p = jnp.exp2(s * scale - bcast(jnp.where(m_valid, m_scale, 0.0)))
+              l_i = jnp.where(needs_rescale, l_i * alpha, l_i) + p.sum(axis=1)
 
-          @pl.loop(0, num_tma_splits)
-          def tma_loop(i):
-            tma_chunk_size = head_dim_out // num_tma_splits
-            block_d = min(config.block_d, tma_chunk_size)
+              with jax.named_scope("write qk_tmem"):
+                plgpu.async_store_tmem(p_tmem.at[si], p.astype(p_tmem.dtype))
+                mgpu_lib.tcgen05_wait_st()
+                mgpu_lib.tcgen05_fence_before_thread_sync()
+                if collective:  # Not all threads arrive on the barrier.
+                  mgpu_lib.warpgroup_barrier()
+                plgpu.barrier_arrive(p_produced.at[si])
+            return m_scale, m_i, l_i
 
-            @pl.loop(0, tma_chunk_size // block_d)
-            def tmem_loop(j):
-              ds = pl.ds(i * tma_chunk_size + j * block_d, block_d)
-              acc = plgpu.async_load_tmem(acc_tmem.at[:, ds], layout=_TMEM)
-              acc *= lax.broadcast_in_dim(alpha, acc.shape, [0])
-              plgpu.async_store_tmem(acc_tmem.at[:, ds], acc)
+          # in 2CTA we have non square blocks hence we may need to process
+          # M//N steps with a mask, for M=256, N=128 this means 2 steps
+          causal_blocks = int(is_causal) * (block_q // block_kv)
+          carry = lax.fori_loop(
+              lb, ub - causal_blocks, kv_loop, (m_i, m_i, l_i)
+          )
 
-            plgpu.commit_tmem()
-            plgpu.barrier_arrive(out_scaled_barrier.at[i])
+          if is_causal:
+            causal_kv_loop = functools.partial(kv_loop, do_causal=True)
+            carry = lax.fori_loop(ub - causal_blocks, ub, causal_kv_loop, carry)
 
-      plgpu.barrier_wait(pv_mma_barrier)
+          m_scale, m_i, l_i = carry
 
-  def entry(*refs):
+          if li_smem is not None:
+            mgpu_lib.bar_sync(_L_CONSUMED, num_threads=256)
+            li_smem[...] = l_i
+            mgpu_lib.bar_arrive(_L_PRODUCED, num_threads=256)
 
-    def tiled_smem(shape, dtype):
-      transforms = common.tile_swizzle_transforms(shape, dtype)
-      return plgpu.SMEM(shape, dtype, transforms=transforms)
+          if return_residuals:
+            if normalize_output and (rescale_threshold != 1.0):
+              m_valid = (mask_gmem is None and not has_k_range) | (
+                  m_i != -jnp.inf
+              )
+              alpha = jnp.where(m_valid, jnp.exp2(m_scale - m_i), 1.0)
+              l_i *= alpha
+            m_i *= 1 / math.log2(math.e)
+            for residual, gmem_ref in zip((m_i, l_i), residual_gmems):
+              gmem_ref.at[hi, qs].set(residual.astype(gmem_ref.dtype))
 
-    q_scratch = tiled_smem((block_q, head_dim), q.dtype)
-    k_scratch = tiled_smem(
-        (
-            num_stages,
-            num_tma_splits,
-            block_kv // 2 if collective else block_kv,
-            head_dim // num_tma_splits,
-        ),
-        k.dtype,
-    )
-    v_scratch = tiled_smem(
-        (
-            num_stages,
-            num_tma_splits,
-            block_kv,
-            head_dim_out // num_tma_splits // (2 if collective else 1),
-        ),
-        k.dtype,
-    )
-    o_scratch = tiled_smem((block_q, head_dim_out), q.dtype)
-    p_scratch = plgpu.TMEM(
-        (block_q, block_kv * softmax_slots),
-        v.dtype,
-        packed=True,
-        collective=collective,
-    )
-    acc_scratch = plgpu.TMEM(
-        (block_q, head_dim_out), jnp.float32, collective=collective
-    )
-    qk_acc_scratch = plgpu.TMEM(
-        (block_q, block_kv), jnp.float32, collective=collective
-    )
-    alpha_scratch = plgpu.SMEM((softmax_slots, block_q), jnp.float32)
-    li_scratch = plgpu.SMEM((block_q,), jnp.float32)
-    mask_scratch = tiled_smem((block_q, block_kv), jnp.int8)
+      @pl.when(wg == _SCALE_WG)
+      def scale_wg():
+        plgpu.set_max_registers(160, action="decrease")
 
-    # TMA barriers
-    k_barrier = v_barrier = plgpu.Barrier(
-        num_barriers=num_stages, num_arrivals=num_tma_splits
-    )
-    q_barrier = plgpu.Barrier()
-    mask_produced_barrier = plgpu.Barrier()
-    mask_consumed_barrier = plgpu.Barrier()
-    # Q@K
-    qk_mma_barrier = plgpu.Barrier(orders_tensor_core=True)
-    k_consumed_barrier = plgpu.Barrier(
-        num_barriers=num_stages * num_tma_splits, orders_tensor_core=True
-    )
-    # P@V
-    pv_mma_barrier = plgpu.Barrier(orders_tensor_core=True)
-    v_consumed_barrier = plgpu.Barrier(
-        num_barriers=num_stages * num_tma_splits, orders_tensor_core=True
-    )
-    if collective:
-      p_produced_barrier = plgpu.ClusterBarrier(
-          num_barriers=2, collective_axes=(collective_axis,)
-      )
-      out_scaled_barrier = plgpu.ClusterBarrier(
-          num_barriers=num_tma_splits, collective_axes=(collective_axis,)
-      )
-      qk_consumed_barrier = plgpu.ClusterBarrier(
-          collective_axes=(collective_axis,)
-      )
-    else:
-      p_produced_barrier = plgpu.Barrier(num_barriers=2)
-      out_scaled_barrier = plgpu.Barrier(num_barriers=num_tma_splits)
-      qk_consumed_barrier = plgpu.Barrier()
+        @pl.when(loop_info.local_index == 0)
+        def prologue():
+          mgpu_lib.bar_arrive(_L_CONSUMED, num_threads=256)
 
-    alpha_produced_barrier = plgpu.Barrier(num_barriers=2)
-    p_consumed_barrier = plgpu.Barrier(num_barriers=2, orders_tensor_core=True)
+        @pl.when(ub > lb)
+        def release_out_scaled_barriers():
+          for i in range(num_tma_splits):
+            plgpu.barrier_arrive(acc_produced.at[i])
 
-    pl.run_scoped(
-        lambda *args: kernel(*refs, scoped=args),
-        (
-            plgpu.RefUnion(q_scratch, o_scratch),
-            k_scratch,
-            v_scratch,
-            p_scratch,
-            mask_scratch,
-            alpha_scratch,
-            li_scratch,
-            acc_scratch,
-            qk_acc_scratch,
-        ),
-        (
-            q_barrier,
-            k_barrier,
-            v_barrier,
-            mask_produced_barrier,
-            mask_consumed_barrier,
-            # Q@K
-            qk_mma_barrier,
-            k_consumed_barrier,
-            qk_consumed_barrier,
-            # P@V
-            pv_mma_barrier,
-            v_consumed_barrier,
-            p_produced_barrier,
-            p_consumed_barrier,
-            alpha_produced_barrier,
-            out_scaled_barrier,
-        ),
-        collective_axes="wg",
-    )
+        def two_in_flight(iterable):
+          for a, _ in itertools.pairwise(itertools.chain(iterable, [None])):
+            yield a
+
+        @pl.loop(lb + 1, ub)
+        def kv_loop(ki):
+          si = lax.rem(prev_iters + ki - lb, alpha_smem.shape[0])
+          plgpu.barrier_wait(pv_mma_produced)
+          tile_d = 32
+
+          def load_acc_tiles():
+            for d_base in range(0, head_dim_out, tile_d):
+              ds = pl.ds(d_base, min(tile_d, head_dim_out - d_base))
+              yield ds, plgpu.async_load_tmem(acc_tmem.at[:, ds], layout=_TMEM)
+
+          acc_tiles = two_in_flight(load_acc_tiles())
+          ds, acc = next(acc_tiles)
+          mgpu_lib.bar_sync(_ALPHA_PRODUCED + si, num_threads=256)
+          alpha = plgpu.load(alpha_smem.at[si], layout=_TMEM_ROW)
+          needs_rescale = (
+              (rescale_threshold == 1.0)
+              | (alpha < rescale_threshold)
+              | ((not normalize_output) & (ki == ub - 1))
+          )
+
+          per_warp_type = plgpu.ShapeDtypeStruct((), jnp.bool_, _WG_SPLAT)
+
+          @plgpu.inline_mgpu(arg_types=(_TMEM_ROW,), return_type=per_warp_type)
+          def warp_any(_, needs_rescale):
+            regs_flat = needs_rescale.registers.flat
+            thread_val = functools.reduce(arith.ori, regs_flat)
+            thread_val = vector.extract(thread_val, [], [0])
+            i32 = ir.IntegerType.get_signless(32)
+            mask = arith.constant(i32, 0xFFFFFFFF)
+            warp_val = nvvm.vote_sync(mask, thread_val, "any")
+            return mgpu.FragmentedArray.splat(warp_val, (), is_signed=False)
+
+          def rescale_acc(ds=ds, acc=acc):
+            for i in range(num_tma_splits):
+              for _ in range(0, head_dim_out // num_tma_splits, tile_d):
+                acc = jnp.where(
+                    lax.broadcast_in_dim(needs_rescale, acc.shape, [0]),
+                    acc * lax.broadcast_in_dim(alpha, acc.shape, [0]),
+                    acc,
+                )
+                plgpu.async_store_tmem(acc_tmem.at[:, ds], acc)
+                try:
+                  ds, acc = next(acc_tiles)
+                except StopIteration:
+                  break
+
+              mgpu_lib.tcgen05_wait_st()
+              mgpu_lib.tcgen05_fence_before_thread_sync()
+              if collective:  # Not all threads arrive on the barrier.
+                mgpu_lib.warpgroup_barrier()
+              plgpu.barrier_arrive(acc_produced.at[i])
+
+          def no_rescale():
+            for i in range(num_tma_splits):
+              if collective:
+                mgpu_lib.warpgroup_barrier()  # To match barrier above.
+              plgpu.barrier_arrive(acc_produced.at[i])
+
+          with jax.named_scope("rescale_acc"):
+            # If none of the threads in the warp need to rescale, then we can
+            # skip loading the accumulator from tmem entirely as the warps
+            # operate independently.
+            rescale_warp = (rescale_threshold == 1.0) or warp_any(needs_rescale)
+            lax.cond(rescale_warp, rescale_acc, no_rescale)
+
+        with jax.named_scope("epilogue"):
+          num_epi_slots, _, epi_tile_d = o_smem.shape
+          num_d_tiles = head_dim_out // epi_tile_d
+          o_gmem_ = o_gmem.at[qs, hi]
+          epi_slot_offset = loop_info.local_index * num_d_tiles
+
+          def write_acc():
+            if li_smem is None:
+              l_rcp = lax.broadcast_in_dim(1.0, acc_tmem.shape, [])
+            else:
+              mgpu_lib.bar_sync(_L_PRODUCED, num_threads=256)
+              l_i = plgpu.load(li_smem, layout=_TCGEN05_ROW)
+              mgpu_lib.bar_arrive(_L_CONSUMED, num_threads=256)
+              l_rcp = 1.0 / (l_i + float(jnp.finfo(jnp.float32).tiny))
+              l_rcp = lax.broadcast_in_dim(l_rcp, acc_tmem.shape, [0])
+            plgpu.barrier_wait(pv_mma_produced)
+
+            def load_acc_tiles():
+              for di in range(num_d_tiles):
+                si = lax.rem(epi_slot_offset + di, num_epi_slots)
+                ds = slice(di * epi_tile_d, (di + 1) * epi_tile_d)
+                acc = plgpu.async_load_tmem(acc_tmem.at[:, ds], layout=_TCGEN05)
+                yield ds, si, acc
+
+            for ds, si, acc in two_in_flight(load_acc_tiles()):
+              acc = (acc * l_rcp[:, ds]).astype(o_smem.dtype)
+              plgpu.wait_smem_to_gmem(num_epi_slots - 1, wait_read_only=True)
+              o_smem[si] = acc
+              plgpu.commit_smem()
+              plgpu.copy_smem_to_gmem(o_smem.at[si], o_gmem_.at[:, ds])
+
+          def write_zeros():
+            if return_residuals:
+              m_gmem, l_gmem = residual_gmems
+              m_gmem[hi, qs] = jnp.full_like(m_gmem.at[hi, qs], -jnp.inf)
+              l_gmem[hi, qs] = jnp.zeros_like(l_gmem.at[hi, qs])
+
+            si = lax.rem(epi_slot_offset, num_epi_slots)
+            plgpu.wait_smem_to_gmem(num_epi_slots - 1, wait_read_only=True)
+            o_smem[si] = jnp.zeros_like(o_smem.at[si])
+            plgpu.commit_smem()
+
+            for di in range(num_d_tiles):
+              ds = slice(di * epi_tile_d, (di + 1) * epi_tile_d)
+              plgpu.copy_smem_to_gmem(
+                  o_smem.at[si], o_gmem_.at[:, ds], commit_group=False
+              )
+            plgpu.commit_smem_to_gmem_group()
+
+          lax.cond(ub > lb, write_acc, write_zeros)
+
+      return prev_iters + lax.max(0, ub - lb)
+
+    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
   def pre_reduce_k_range_per_qtile(range_ref):
     if range_ref is None:
@@ -782,39 +959,52 @@ def flash_attention_kernel(
 
     def pad_reduce(pad_value: int):
       k_range_ = shape_lib.pad_to_next_multiple_of(
-          range_ref, tile_q, -1, pad_value
+          range_ref, block_q, -1, pad_value
       )
-      return shape_lib.einshape("...(bq)->...bq", q=tile_q)(k_range_)
+      return shape_lib.einshape("...(bq)->...bq", q=block_q)(k_range_)
 
     return (jnp.min(pad_reduce(kv_seq_len), -1), jnp.max(pad_reduce(0), -1))
 
   k_start_minmax = pre_reduce_k_range_per_qtile(k_start)
   k_end_minmax = pre_reduce_k_range_per_qtile(k_end)
 
-  out_shape = [jax.ShapeDtypeStruct((*q.shape[:-1], head_dim_out), q.dtype)]
+  out_shape = [jax.ShapeDtypeStruct((*q.shape[:-1], head_dim_out), out_dtype)]
   if return_residuals:
-    residuals_shape = (num_q_heads, pl.cdiv(q_seq_len, tile_q) * tile_q)
+    residuals_shape = (num_q_heads, pl.cdiv(q_seq_len, block_q) * block_q)
     out_shape += [jax.ShapeDtypeStruct(residuals_shape, jnp.float32)] * 2
+
+  scratch_types = _get_scratch_types(
+      q, k, v, bias, mask, out_dtype, config, normalize_output=normalize_output
+  )
 
   profile = False
   compiler_params = plgpu.CompilerParams(
       approx_math=True,
       unsafe_no_auto_barriers=True,
+      reduction_scratch_bytes=0,
       profile_space=128 if profile else 0,
       profile_dir="sponge" if profile else "",
   )
-  out, *residuals = plgpu.kernel(
-      entry,
-      out_shape=out_shape,
+
+  if config.persistent:
+    maybe_persistent_kernel = mgpu_lib.dynamic_scheduling_persistent_kernel
+  else:
+    maybe_persistent_kernel = mgpu_lib.not_persistent_grid_loop_kernel
+
+  out, *residuals = maybe_persistent_kernel(
+      kernel,
+      out_type=out_shape,
+      scratch_types=scratch_types,
       grid=(num_q_heads, num_q_tiles),
       grid_names=("heads", "q_tiles"),
       num_threads=3,
       thread_name="wg",
       cluster=(1 + collective,),
-      cluster_names=("x",),
+      cluster_names=("cluster",),
       compiler_params=compiler_params,
-  )(q, k, v, mask, k_start, k_end, k_start_minmax, k_end_minmax)
+      kernel_name="flash_attention_sm100",
+  )(q, k, v, bias, mask, k_start, k_end, k_start_minmax, k_end_minmax)
 
+  out = out[:orig_q_seq_len, ...]
   residuals = tuple(res[..., :orig_q_seq_len] for res in residuals)
-  out = out[..., :orig_q_seq_len, :, :orig_head_dim_out]
-  return (out, residuals if residuals else None)
+  return (out[..., :orig_head_dim_out], residuals if residuals else None)

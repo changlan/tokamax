@@ -16,7 +16,8 @@
 
 from collections.abc import Callable
 import functools
-from typing import Any, ClassVar, Literal, TypeVar, overload
+from typing import Any, ClassVar, Literal, overload, override
+
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
@@ -26,14 +27,13 @@ from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
-from typing_extensions import override
 
 
+CanonicalPrecision = precision_lib.CanonicalPrecision
 QArray = qwix.QArray
 
 
-_Config = TypeVar("_Config")
-_Key = TypeVar("_Key")
+# Type variables used below are defined in the generic class signature.
 # The attention residuals come from the softmax calculation:
 # `(maximum softmax input values, softmax denominator)`.
 Residuals = tuple[Float[Array, "*B H T"], Float[Array, "*B H T"]]
@@ -41,8 +41,8 @@ ScoreMod = Callable[[Float[Array, "*B H T t"]], Float[Array, "*B H T t"]]
 MaskMod = Callable[[tuple[int, ...]], Bool[Array, "*#B #H #T #t"]]
 
 
-class FlexAttention(
-    op.Op[Any, Float[Array, "*B T H d"], Residuals, _Config, _Key]
+class FlexAttention[C, K](
+    op.Op[Any, Float[Array, "*B T H d"], Residuals, C, K]
 ):
   """FlexAttention function."""
 
@@ -89,7 +89,7 @@ class FlexAttention(
       q_sharding: jax.sharding.NamedSharding | None = ...,
       k_sharding: jax.sharding.NamedSharding | None = ...,
       normalize_output: bool = ...,
-      return_residuals: Literal[True] = ...,
+      return_residuals: Literal[True],
   ) -> tuple[Float[Array, "*B T H d"], Residuals]:
     ...
 
@@ -216,19 +216,11 @@ class FlexAttention(
     if not isinstance(precision, tuple):
       precision = (precision, precision)
 
-    q_k_dot_precision, p_v_dot_precision = precision
-    q_k_dot_precision = precision_lib.to_dot_algorithm_preset(
-        q.dtype, k.dtype, q_k_dot_precision
-    )
-    p_v_dot_precision = precision_lib.to_dot_algorithm_preset(
-        v.dtype, v.dtype, p_v_dot_precision
-    )
-
     return super().bind(
         q,
         k,
         v,
-        precision=(q_k_dot_precision, p_v_dot_precision),
+        precision=tuple(map(precision_lib.canonicalize_precision, precision)),
         score_mod=score_mod,
         mask_mod=mask_mod,
         dropout_mask=dropout_mask,
@@ -245,14 +237,14 @@ class FlexAttention(
       k: Float[Array | QArray, "*B t h D"],
       v: Float[Array | QArray, "*B t h d"],
       *,
-      precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+      precision: tuple[CanonicalPrecision, CanonicalPrecision],
       score_mod: ScoreMod | None,
       mask_mod: MaskMod | None,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
       dropout_rate: float,
       normalize_output: bool,
       return_residuals: bool,
-      config: _Config,
+      config: C,
   ) -> tuple[Float[Array, "*B T H d"], Residuals | None]:
     del config  # Unused.
 
@@ -265,6 +257,12 @@ class FlexAttention(
         v = jnp.repeat(v, repeats, axis=-2)
 
     q_k_dot_precision, weights_v_dot_precision = precision
+    q_k_dot_precision = precision_lib.to_dot_algorithm_preset(
+        q.dtype, k.dtype, q_k_dot_precision
+    )
+    weights_v_dot_precision = precision_lib.to_dot_algorithm_preset(
+        v.dtype, v.dtype, weights_v_dot_precision
+    )
 
     logits = jnp.einsum(
         "...qhd,...khd->...hqk",
@@ -274,7 +272,8 @@ class FlexAttention(
         preferred_element_type=q_k_dot_precision.accumulation_type,
     )
 
-    logits = score_mod(logits)
+    if score_mod is not None:
+      logits = score_mod(logits)
 
     if mask_mod is not None:
       # This is not `-inf` as this can lead to `NaN`s when a full softmax row is

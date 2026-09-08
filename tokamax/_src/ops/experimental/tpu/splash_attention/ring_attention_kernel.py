@@ -46,7 +46,7 @@ def _dynamic_slice_mask_info(
 ) -> MaskInfo:
   """Slices MaskInfo for the current ring step."""
 
-  def slice_if_exists(arr: jax.Array | None):
+  def slice_if_exists(arr: jax.Array | np.ndarray | None):
     if arr is None:
       return None
 
@@ -118,7 +118,7 @@ def _ring_attention_forward(
       max_logit_value=None,
   )
   # Initial accumulator values
-  o_shape = q.shape
+  o_shape = (*q.shape[:-1], v.shape[-1])
   o_init = jnp.zeros(o_shape, dtype=jnp.float32)
   l_init = jnp.zeros((o_shape[0], o_shape[1]), jnp.float32)
   m_init = jnp.full_like(l_init, mask_value, dtype=jnp.float32)
@@ -193,7 +193,7 @@ def _ring_attention_bwd(
     do: jax.Array,
 ):
   del save_residuals
-  (q, k, v, segment_ids, sinks, out, logsumexp, dkv_mask_info) = res
+  q, k, v, segment_ids, sinks, out, logsumexp, dkv_mask_info, _ = res
   do = do.astype(jnp.float32)
 
   ring_axis_size = lax.axis_size(ring_axis)
@@ -241,6 +241,7 @@ def _ring_attention_bwd(
         out,
         logsumexp,
         local_dkv_mask_info,
+        None,  # prng_key: ring attention does not expose attention dropout.
     )
 
     attn_bwd = functools.partial(
@@ -253,8 +254,8 @@ def _ring_attention_bwd(
         fwd_mask_sparsity=fwd_mask_sparsity,
         dkv_mask_sparsity=dkv_mask_sparsity,
     )
-    _, _, dq_i, dk_i, dv_i, _, dsinks, _ = attn_bwd(
-        res=residuals_for_chunk, do=do
+    _, _, dq_i, dk_i, dv_i, _, dsinks, _, _ = attn_bwd(
+        res=residuals_for_chunk, grads=do
     )
     dv_next = shift(dv_accum + dv_i.astype(dv_accum.dtype))
     dk_next = shift(dk_accum + dk_i.astype(dk_accum.dtype))
@@ -356,7 +357,7 @@ def _ring_attention_fwd(
       fwd_mask_sparsity=fwd_mask_sparsity,
       ring_axis=ring_axis,
   )
-  residuals = (q, k, v, segment_ids, sinks, out, logsumexp, dkv_mask_info)
+  residuals = (q, k, v, segment_ids, sinks, out, logsumexp, dkv_mask_info, None)
   return out, residuals
 
 
@@ -577,14 +578,14 @@ class RingSplashAttentionKernel:
     spec = jax.sharding.PartitionSpec(self.ring_axis)
     _resolve_spec = lambda x: spec if x is not None else None
 
-    mask_info_specs = MaskInfo(  # pytype: disable=wrong-arg-types
-        mask_next=_resolve_spec(self.fwd_mask_info.mask_next),
-        active_rows=_resolve_spec(self.fwd_mask_info.active_rows),
-        active_cols=_resolve_spec(self.fwd_mask_info.active_cols),
-        num_active_blocks=_resolve_spec(self.fwd_mask_info.num_active_blocks),
-        block_mask=_resolve_spec(self.fwd_mask_info.block_mask),
-        partial_mask_blocks=jax.sharding.PartitionSpec(),  # replicated
-        q_sequence=_resolve_spec(self.fwd_mask_info.q_sequence),
+    mask_info_specs = MaskInfo(
+        mask_next=_resolve_spec(self.fwd_mask_info.mask_next),  # pyrefly: ignore[bad-argument-type]
+        active_rows=_resolve_spec(self.fwd_mask_info.active_rows),  # pyrefly: ignore[bad-argument-type]
+        active_cols=_resolve_spec(self.fwd_mask_info.active_cols),  # pyrefly: ignore[bad-argument-type]
+        num_active_blocks=_resolve_spec(self.fwd_mask_info.num_active_blocks),  # pyrefly: ignore[bad-argument-type]
+        block_mask=_resolve_spec(self.fwd_mask_info.block_mask),  # pyrefly: ignore[bad-argument-type]
+        partial_mask_blocks=jax.sharding.PartitionSpec(),  # replicated  # pyrefly: ignore[bad-argument-type]
+        q_sequence=_resolve_spec(self.fwd_mask_info.q_sequence),  # pyrefly: ignore[bad-argument-type]
     )
     return RingSplashAttentionKernel(
         mask_info_specs,

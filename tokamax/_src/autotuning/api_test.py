@@ -14,8 +14,8 @@
 # ==============================================================================
 import dataclasses
 import functools
-import types
-from typing import Any
+import time
+from typing import Any, override
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -25,6 +25,7 @@ from jax.extend import backend
 import jax.numpy as jnp
 from tokamax._src import batching
 from tokamax._src import benchmarking
+from tokamax._src import version
 from tokamax._src.autotuning import api
 from tokamax._src.autotuning import autotuner
 from tokamax._src.ops import op as op_lib
@@ -46,13 +47,19 @@ class _FakeOpConfig:
 _HEURISTICS_CONFIG = _FakeOpConfig(42)
 
 
-class _FakeOp(op_lib.Op[Any, jax.Array, types.NoneType, _FakeOpConfig, Any]):
+class _FakeOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
+
+  @property
+  def autotuning_configs(self) -> set[_FakeOpConfig]:
+    return {_HEURISTICS_CONFIG}
 
   def _fwd(self, x: jax.Array, y: jax.Array, *, return_residuals: bool, config):
     return x + y, None
 
   def _get_heuristics_config(self, ba: op_lib.BoundArguments) -> _FakeOpConfig:
     return _HEURISTICS_CONFIG
+
+
 
 
 def get_fn_and_args_and_expected_bound_args(x_shape, vmap=False):
@@ -74,16 +81,24 @@ def get_fn_and_args_and_expected_bound_args(x_shape, vmap=False):
   if vmap:
     ax = (0, None, None, None)
     f = jax.vmap(f, in_axes=ax)
+
     def as_batched(x, a):
       shape = list(x.shape)
       vmap_axis = None if a is None else (a, shape.pop(a))
       return batching.BatchedShapeDtype(shape, x.dtype, (vmap_axis,))
+
     x, scale, offset, weights = map(as_batched, args, ax)
   expected_bound_args = (
-      norm.bind(x, scale, offset, epsilon=eps),  # pytype: disable=wrong-arg-types
-      glu.bind(x, weights, activation=act),  # pytype: disable=wrong-arg-types
+      norm.bind(x, scale, offset, epsilon=eps),  # pyrefly: ignore[bad-argument-type]
+      glu.bind(x, weights, activation=act),  # pyrefly: ignore[bad-argument-type]
   )
   return f, args, expected_bound_args
+
+
+def _slow_fn_factory(config):
+  del config  # Unused.
+  time.sleep(0.5)
+  return lambda x: x
 
 
 class AutotuningTest(parameterized.TestCase):
@@ -146,8 +161,8 @@ class AutotuningTest(parameterized.TestCase):
         x=jax.ShapeDtypeStruct((64, 128), dtype=jnp.bfloat16),
         weights=jax.ShapeDtypeStruct((128, 2, 128), dtype=jnp.bfloat16),
     )
-    bound_arg0 = pl_glu.PallasTritonGatedLinearUnit().bind(**shapes)  # pytype: disable=wrong-arg-types
-    bound_arg1 = glu_base.GatedLinearUnit().bind(**shapes)  # pytype: disable=wrong-arg-types
+    bound_arg0 = pl_glu.PallasTritonGatedLinearUnit().bind(**shapes)  # pyrefly: ignore[bad-argument-type]
+    bound_arg1 = glu_base.GatedLinearUnit().bind(**shapes)  # pyrefly: ignore[bad-argument-type]
     assert bound_arg0.autotuning_cache_key == bound_arg1.autotuning_cache_key
     expected = (bound_arg0, bound_arg1)
     f_lowered = jax.jit(f).lower(**shapes)
@@ -160,15 +175,15 @@ class AutotuningTest(parameterized.TestCase):
     glu = pl_glu.PallasTritonGatedLinearUnit()
     act = jax.nn.swish
     f = functools.partial(glu, activation=act)
-    g = jax.value_and_grad(lambda x, weights: f(x, weights).sum())  # pytype: disable=attribute-error
+    g = jax.value_and_grad(lambda x, weights: f(x, weights).sum())
 
     x_shape = (64, 128)
     d = x_shape[-1]
     x = jax.ShapeDtypeStruct(x_shape, dtype=jnp.bfloat16)
     weights = jax.ShapeDtypeStruct((d, 2, d), dtype=jnp.bfloat16)
     actual = api.get_bound_args(jax.jit(g).lower(x, weights))
-    bound_arg = glu.bind(x, weights, activation=act, return_residuals=True)  # pytype: disable=wrong-arg-types
-    vjp_bound_arg = glu.vjp.bind(**bound_arg.vjp_arg_spec)  # pytype: disable=attribute-error
+    bound_arg = glu.bind(x, weights, activation=act, return_residuals=True)  # pyrefly: ignore[bad-argument-type]
+    vjp_bound_arg = glu.vjp.bind(**bound_arg.vjp_arg_spec)  # pyrefly: ignore[missing-attribute]
     self.assertCountEqual(actual, (bound_arg, vjp_bound_arg))
 
   def test_autotune(self):
@@ -190,8 +205,11 @@ class AutotuningTest(parameterized.TestCase):
     # TODO: Test that we autotune against all implementations.
     self.assertContainsSubset(expected, tuple(x[0] for x in result.data))
 
+    res_json = result.dumps()
     res_round_trip = api.AutotuningResult.loads(result.dumps())
     self.assertEqual(result, res_round_trip)
+    self.assertIn("tokamax_version", res_json)
+    self.assertIn(version.TOKAMAX_VERSION, res_json)
 
     tempfile = self.create_tempfile("autotuning_results.json")
     with open(tempfile.full_path, "w") as f:
@@ -199,7 +217,54 @@ class AutotuningTest(parameterized.TestCase):
     with open(tempfile.full_path, "r") as f:
       self.assertEqual(result, api.AutotuningResult.load(f))
 
+  def test_autotune_with_timeout(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Currently only supported on GPU.")
+
+    x = jnp.zeros((1, 2))
+    y = jnp.ones((1, 2))
+    ba = _FakeOp().bind(x, y)
+    result = api.autotune([ba], timeout=120.0)
+    self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
+
+  def test_autotune_timeout_triggered(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Currently only supported on GPU.")
+
+    t = autotuner.Autotuner()
+    results = t.autotune(_slow_fn_factory, {1, 2}, timeout=0.01)
+    self.assertIn(1, results)
+    self.assertIn(2, results)
+    self.assertIsInstance(results[1], TimeoutError)
+    self.assertIsInstance(results[2], TimeoutError)
+    with self.assertRaises(ExceptionGroup):
+      _ = results.fastest_config
+
+  def test_autotune_with_max_workers(self):
+    x = jnp.zeros((1, 2))
+    y = jnp.ones((1, 2))
+    ba = _FakeOp().bind(x, y)
+    result = api.autotune([ba], max_workers=1)
+    self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
+    self.assertNotEmpty(result.data)
+    _, autotune_data = result.data[0]
+    self.assertIn(_HEURISTICS_CONFIG, autotune_data)
+
+
+
+  def test_bound_args_to_from_json(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Currently only supported on GPU.")
+
+    f, args, expected = get_fn_and_args_and_expected_bound_args((64, 128))
+    f_lowered = jax.jit(f).lower(*args)
+    tempfile = self.create_tempfile("bound_args.json")
+    api.bound_args_to_json(f_lowered, tempfile.full_path)
+    loaded_bound_args = api.bound_args_from_json_file(tempfile.full_path)
+    self.assertEqual(loaded_bound_args, list(expected))
+
   def test_autotuning_result_context(self):
+
     op = _FakeOp()
     ba = op.bind(jnp.zeros((1, 2)), jnp.zeros((3,)))
     ba2 = op.bind(jnp.zeros((4, 5)), jnp.zeros((6,)))
@@ -209,6 +274,7 @@ class AutotuningTest(parameterized.TestCase):
         lower_time_ms=0.0,
         evaluation_times_ms=(0.0,),
         metadata={},
+        peak_memory_mb=0.0,
     )
     config0, config1, config2, config3 = map(_FakeOpConfig, range(4))
     data0 = autotuner.AutotuningData({config0: bmark_data})
@@ -281,6 +347,7 @@ class AutotuningTest(parameterized.TestCase):
         lower_time_ms=0.0,
         evaluation_times_ms=(0.0,),
         metadata={},
+        peak_memory_mb=0.0,
     )
     config0 = _FakeOpConfig(0)
     config1 = _FakeOpConfig(1)
@@ -290,8 +357,6 @@ class AutotuningTest(parameterized.TestCase):
     result1 = api.AutotuningResult(device_kind, ((ba, data1),))
     f = jax.jit(op)
 
-    # Register context hook before first call, so first and last are identical.
-    _ = op_lib.get_autotuning_cache_overlay_state()
     _ = f(x, y)
     with result0:
       _ = f(x, y)
@@ -333,8 +398,49 @@ class AutotuningTest(parameterized.TestCase):
     self.assertNotEmpty(result.data)
     for _, data in result.data:
       for _, benchmark in data.items():
-        self.assertGreater(benchmark.median_evaluation_time_ms, 0.0)
+        if isinstance(benchmark, benchmarking.BenchmarkData):
+          self.assertGreater(benchmark.median_evaluation_time_ms, 0.0)
+        else:
+          self.assertIsInstance(benchmark, Exception)
 
+  def test_autotuning_error_message(self):
+    """Try to autotune a base op and make sure an error message is raised."""
+
+    class _FakeErrorOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
+
+      def _fwd(self, x, *, config, return_residuals):
+        raise ValueError("Fake error")
+
+      @override
+      def _get_autotuning_configs(
+          self, ba: op_lib.BoundArguments
+      ) -> set[_FakeOpConfig]:
+        del ba  # Unused.
+        return set([_FakeOpConfig(42), _FakeOpConfig(43)])
+
+    op = _FakeErrorOp()
+    ba = op.bind(jnp.zeros((1, 2)))
+    result = ba.autotune()
+    self.assertNotEmpty(result.items())
+    benchmark_data = list(result.values())[0]
+    self.assertIsInstance(benchmark_data, Exception)
+
+  @parameterized.parameters(True, False)
+  def test_autotuning_ignore_cache(self, ignore_cache):
+    f = jax.jit(lambda x: _FakeOp()(x, x))
+    x = jnp.zeros((3, 7))
+
+    res = api.autotune(f, x, ignore_cache=ignore_cache)
+    self.assertLen(res.data, 1)
+    # Test that this is not stateful (results are not cached between calls).
+    res = api.autotune(f, x, ignore_cache=ignore_cache)
+    self.assertLen(res.data, 1)
+
+    with res:
+      res_new = api.autotune(f, x, ignore_cache=ignore_cache)
+
+      expected_len = 1 if ignore_cache else 0
+      self.assertLen(res_new.data, expected_len)
 
 if __name__ == "__main__":
   absltest.main()

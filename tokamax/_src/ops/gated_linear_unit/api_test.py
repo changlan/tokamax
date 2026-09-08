@@ -20,8 +20,8 @@ from absl.testing import parameterized
 import chex
 import jax
 import jax.numpy as jnp
-from tokamax import autotuning
 from tokamax._src import gpu_utils
+from tokamax._src import hlo_utils
 from tokamax._src.ops.gated_linear_unit import api
 from tokamax._src.ops.gated_linear_unit import test_base
 
@@ -46,8 +46,6 @@ class GatedLinearUnitTest(parameterized.TestCase):
   def test_basic_api(self, implementation, use_tuple_weights):
     if implementation == "triton" and not gpu_utils.has_triton_support():
       self.skipTest("Triton not supported on this platform.")
-    if implementation == "mosaic":
-      self.skipTest("TODO: Fix and re-enable.")
 
     if not gpu_utils.has_mosaic_gpu_support() and implementation is not None:
       if "mosaic" in implementation:
@@ -78,7 +76,7 @@ class GatedLinearUnitTest(parameterized.TestCase):
     with self.subTest("value"):
       chex.assert_trees_all_close(out, out_golden)
 
-    args = autotuning.get_bound_args(f.lower(lhs, rhs))
+    args = hlo_utils.get_bound_args(f.lower(lhs, rhs))
     self.assertLen(args, 1)
 
     self.assertEqual(lhs.dtype, jnp.bfloat16)
@@ -94,6 +92,7 @@ class GatedLinearUnitTest(parameterized.TestCase):
           # Ensure either a Triton or Mosaic kernel is used.
           self.assertTrue(
               isinstance(op, api.IMPLEMENTATIONS["triton"].__class__)
+              or isinstance(op, api.IMPLEMENTATIONS["mosaic"].__class__)
           )
       else:
         self.assertIsInstance(op, api.IMPLEMENTATIONS[implementation].__class__)

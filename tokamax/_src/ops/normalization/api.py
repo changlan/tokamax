@@ -15,32 +15,32 @@
 """Layer Normalization API."""
 
 from collections.abc import Callable, Sequence
-from typing import Any, Final, Literal, TypeAlias
+from typing import Any, Final, Literal
 
-from absl import logging
 import immutabledict
 import jax
 from tokamax._src import gpu_utils
 from tokamax._src.ops.normalization import base
 
 
-Implementation: TypeAlias = Literal['xla', 'triton']
+type Implementation = Literal['xla', 'triton']
 
-IMPLEMENTATIONS = dict(xla=base.Normalization())
-_DEFAULT_IMPLEMENTATION = ('xla',)
+_IMPLEMENTATIONS = dict(xla=base.Normalization())
+_DEFAULT_IMPLEMENTATIONS = ('xla',)
 
 try:
-  from tokamax._src.ops.normalization import pallas_triton  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.normalization import pallas_triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
-  IMPLEMENTATIONS['triton'] = pallas_triton.PallasTritonNormalization()
-  _DEFAULT_IMPLEMENTATION = ('triton',) + _DEFAULT_IMPLEMENTATION
+  _IMPLEMENTATIONS['triton'] = pallas_triton.PallasTritonNormalization()
+  _DEFAULT_IMPLEMENTATIONS = ('triton',) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
 
 
 IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
-    immutabledict.immutabledict(IMPLEMENTATIONS)
+    immutabledict.immutabledict(_IMPLEMENTATIONS)
 )
+del _IMPLEMENTATIONS
 
 
 def layer_norm(
@@ -87,9 +87,8 @@ def layer_norm(
     The normalized array with the same shape as the input `x`.
   """
   if implementation is None:
-    implementation = _DEFAULT_IMPLEMENTATION
-
-  if not isinstance(implementation, (tuple, list)):
+    implementation = _DEFAULT_IMPLEMENTATIONS
+  elif isinstance(implementation, str):
     implementation = (implementation,)
   elif not implementation:
     raise ValueError('`implementation` must not be an empty sequence.')
@@ -124,7 +123,6 @@ def layer_norm(
           subtract_mean=subtract_mean,
       )
     except NotImplementedError as e:
-      logging.error('Failed to run implementation: %s', e)
       errors.append(e)
 
   raise ExceptionGroup('all implementations failed', errors)
