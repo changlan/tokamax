@@ -122,7 +122,7 @@ def _get_scratch_types(
     tile_q = config.block_q // 2
     tile_k = config.block_kv // 2
     maybe_cluster_barrier = functools.partial(
-        plgpu.ClusterBarrier, collective_axes=("cluster",)
+        plgpu.ClusterBarrier, collective_axes=("cluster",), leader_tracked=True
     )
   else:
     tile_q = config.block_q
