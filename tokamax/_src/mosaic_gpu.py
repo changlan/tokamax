@@ -95,6 +95,11 @@ def tcgen05_fence_before_thread_sync(_):
 
 
 @plgpu.inline_mgpu()
+def tcgen05_fence_after_thread_sync(_):
+  nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.AFTER_THREAD_SYNC)
+
+
+@plgpu.inline_mgpu()
 def fence_async_shared_cta(_):
   space = nvvm.SharedSpace.shared_cta
   nvvm.fence_proxy(nvvm.ProxyKind.async_shared, space=space)

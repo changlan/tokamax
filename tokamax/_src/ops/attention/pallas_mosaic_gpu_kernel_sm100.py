@@ -168,15 +168,10 @@ def _get_scratch_types(
       v_produced=kv_produced,
       v_consumed=kv_consumed,
       s_produced=plgpu.Barrier(orders_tensor_core=True),
-      s_consumed=maybe_cluster_barrier(orders_tensor_core=True),
+      s_consumed=maybe_cluster_barrier(),
       pv_mma_produced=plgpu.Barrier(orders_tensor_core=True),
-      # The `p_produced` does order the tensor core, but we insert the correct
-      # PTX directive on arrive to avoid redundancy on wait as `acc_produced`
-      # wait already has it.
       p_produced=maybe_cluster_barrier(num_barriers=2),
-      acc_produced=maybe_cluster_barrier(
-          num_barriers=num_tma_splits, orders_tensor_core=True
-      ),
+      acc_produced=maybe_cluster_barrier(num_barriers=num_tma_splits),
   )
 
   if bias is not None and bias.shape[-2] != 1 and bias.shape[-1] != 1:
@@ -555,6 +550,7 @@ def flash_attention_kernel(
             with jax.named_scope("wait_k"):
               plgpu.barrier_wait(s_consumed)
               plgpu.barrier_wait(k_produced.at[si])
+              mgpu_lib.tcgen05_fence_after_thread_sync()
 
             @pl.loop(0, num_tma_splits)
             def tma_loop(split_idx):
@@ -584,6 +580,7 @@ def flash_attention_kernel(
               block_d = head_dim_out // num_tma_splits
               ds = pl.ds(split_idx * block_d, block_d)
               plgpu.barrier_wait(acc_produced.at[split_idx])
+              mgpu_lib.tcgen05_fence_after_thread_sync()
               with jax.named_scope("issuing P@V"):
                 plgpu.tcgen05_mma(
                     acc_tmem.at[:, ds],
@@ -690,6 +687,9 @@ def flash_attention_kernel(
             plgpu.barrier_arrive(bias_consumed)
 
           mgpu_lib.tcgen05_wait_ld()
+          mgpu_lib.tcgen05_fence_before_thread_sync()
+          if collective:  # Not all threads arrive on the barrier.
+            mgpu_lib.warpgroup_barrier()
           plgpu.barrier_arrive(s_consumed)
 
         if bias is not None:
@@ -825,10 +825,15 @@ def flash_attention_kernel(
                 break
 
             mgpu_lib.tcgen05_wait_st()
+            mgpu_lib.tcgen05_fence_before_thread_sync()
+            if collective:  # Not all threads arrive on the barrier.
+              mgpu_lib.warpgroup_barrier()
             plgpu.barrier_arrive(acc_produced.at[i])
 
         def no_rescale():
           for i in range(num_tma_splits):
+            if collective:  # Not all threads arrive on the barrier.
+              mgpu_lib.warpgroup_barrier()  # Must match above.
             plgpu.barrier_arrive(acc_produced.at[i])
 
         with jax.named_scope("rescale_acc"):
